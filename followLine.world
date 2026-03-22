@@ -1,0 +1,80 @@
+define box model
+(
+  size [0.5 0.5 0.8]
+  gui_nose 0
+)
+
+define sonarring ranger
+(
+  sensor
+  ( 			
+   range [ 0.0  3.0 ] # min and max range
+   fov 180 # front field of view
+   samples 8 # number of samples to return
+  )
+
+  # the visual rep of the ranger
+  color "black"
+  size [ 0.05 0.05 0.1 ]
+)
+
+define mycamera camera
+(
+  range [ 0.2 8.0 ]
+  resolution [ 320 240 ]
+  fov [ 53 40 ]
+  pantilt [ 0 50 ]
+  alwayson 1
+)
+
+define erratic position
+(
+  size [0.35 0.35 0.15]
+  origin [-0.05 0 0 0]
+  gui_nose 1
+  drive "diff"
+  sonarring(pose [ 0.050 0.000 0 0.000 ])
+  mycamera(pose [ .10 0 .35 90.0 ])
+)
+
+define ground model
+(
+  gui_nose 0
+  gui_grid 0
+  gui_outline 0
+  gui_move 0
+  gripper_return 0
+  fiducial_return 0
+  obstacle_return 0
+)
+
+# set the resolution of the underlying raytrace model in meters
+resolution 0.02
+
+# simulation timestep in milliseconds
+interval_sim 100  
+
+window
+( 
+  size [ 500 500 ] 
+  rotate [ 0 0 ]
+  scale 60
+)
+
+ground
+( 
+  name "line"
+  color "blue"
+  # bitmap "lineBackground-1.png"
+  bitmap "lineBackground-2.png"
+  # This is the size in metres of the simulation x y z (height)
+  size [7 7 0.001]
+  pose [ 0 0 0 0 ]
+  obstacle_return 0
+  laser_return 0
+)
+
+erratic( pose [ -3.3 3.3 0 -40.000 ] name "era" color "blue")
+
+# an example obstacle
+box( pose [ 0.17 0.24 0.00 -40.11 ] name "box1" color "gray30")

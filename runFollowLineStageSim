@@ -1,0 +1,1 @@
+pyrobot -s StageSimulator.py -w ./followLine.world -r Stage.py -b BrainFollowLine.py
