@@ -65,8 +65,9 @@ ground
 ( 
   name "line"
   color "blue"
-  # bitmap "lineBackground-1.png"
-  bitmap "lineBackground-2.png"
+  bitmap "lineBackground-1.png"
+  # bitmap "lineBackground-2.png"
+  # bitmap "Linea3.png"
   # This is the size in metres of the simulation x y z (height)
   size [7 7 0.001]
   pose [ 0 0 0 0 ]
@@ -77,4 +78,8 @@ ground
 erratic( pose [ -3.3 3.3 0 -40.000 ] name "era" color "blue")
 
 # an example obstacle
+# Box for lines 1 and 2
 box( pose [ 0.17 0.24 0.00 -40.11 ] name "box1" color "gray30")
+
+# Box for line 3
+# box( pose [ -0.26 0.58 0.00 -40.11 ] name "box1" color "gray30")
