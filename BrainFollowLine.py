@@ -1,3 +1,9 @@
+# Entrega de Control de Robótica y Percepción Computacional.
+# Alumnos:
+# Lucía Fuentes González
+# Miriam Bernat Jiménez
+# Tania Mobasser Aslfakouri
+
 from pyrobot.brain import Brain
 
 import cv2
@@ -20,8 +26,8 @@ class BrainFollowLine(Brain):
   NO_ERROR = 0
 
   # Obstacle avoidance distance
-  OBSTACLE_STOP = 0.55
-  OBSTACLE_WARN = 0.80
+  OBSTACLE_STOP = 0.30
+  OBSTACLE_WARN = 0.60
 
   # PD gains
   LINE_KP = 0.9
@@ -123,6 +129,7 @@ class BrainFollowLine(Brain):
       # Forward speed
       forward = max(self.VERY_SLOW_FORWARD, self.FULL_FORWARD - abs(turn * 1.5))
       self.move(forward, turn)
+      print(f"FOLLOW | error={error:.4f} d_error={d_error:.4f} turn={turn:.4f} forward={forward:.2f}")
     else:
       self._lost_line_steps += 1
       if self._lost_line_steps == 1:
@@ -145,6 +152,7 @@ class BrainFollowLine(Brain):
         self._search_dir *= -1
         self._lost_line_steps = 0
         self.move(self.VERY_SLOW_FORWARD, self._search_dir)
+      print(f"SEARCH | step={self._lost_line_steps} last_error={self.last_error:.4f} dir={self._search_dir:.2f}")
 
 def INIT(engine):
   assert (engine.robot.requires("range-sensor") and
