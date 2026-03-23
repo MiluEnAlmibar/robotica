@@ -1,5 +1,5 @@
 # Entrega de Control de Robótica y Percepción Computacional.
-# Alumnos:
+# Alumnas:
 # Lucía Fuentes González
 # Miriam Bernat Jiménez
 # Tania Mobasser Aslfakouri
@@ -130,6 +130,7 @@ class BrainFollowLine(Brain):
       forward = max(self.VERY_SLOW_FORWARD, self.FULL_FORWARD - abs(turn * 1.5))
       self.move(forward, turn)
       print(f"FOLLOW | error={error:.4f} d_error={d_error:.4f} turn={turn:.4f} forward={forward:.2f}")
+      
     else:
       self._lost_line_steps += 1
       if self._lost_line_steps == 1:
