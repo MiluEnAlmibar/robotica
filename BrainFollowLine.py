@@ -6,7 +6,7 @@ from pyrobot.tools.followLineTools import findLineDeviation
 class BrainFollowLine(Brain):
  
   NO_FORWARD = 0
-  CRAWL_FORWARD = 0.05
+  VERY_SLOW_FORWARD = 0.05
   SLOW_FORWARD = 0.1
   MED_FORWARD = 0.5
   FULL_FORWARD = 1.0
@@ -19,53 +19,25 @@ class BrainFollowLine(Brain):
 
   NO_ERROR = 0
 
-  # Distance thresholds (meters) for obstacle avoidance.
+  # Obstacle avoidance distance
   OBSTACLE_STOP = 0.55
   OBSTACLE_WARN = 0.80
 
-  # Proportional gain for line tracking.
+  # PD gains
   LINE_KP = 0.9
   LINE_KD = 0.5
 
-  SHOW_CAMERA = True
-
-  # Steps before slowing the search pivot (avoids overshooting).
-  PIVOT_SLOW_AFTER  = 15
-  # Steps before reversing search direction (pendulum, for >90° turns).
-  PIVOT_REVERSE_AFTER = 35
+  # Lost-line search behavior
+  SEARCH_SLOW_AFTER = 15
+  SEARCH_REVERSE_AFTER = 35
 
   def setup(self):
-    self._window_ready = False
-    self._last_error = 0.0
+    self.last_error = 0.0
     self._lost_line_steps = 0
     self._search_dir = self.HARD_RIGHT
 
-    if self.SHOW_CAMERA:
-      try:
-        cv2.startWindowThread()
-      except Exception:
-        pass
-
   def destroy(self):
-    if self.SHOW_CAMERA:
-      try:
-        cv2.destroyAllWindows()
-      except Exception:
-        pass
-
-  def _show_camera(self, window_name, image):
-    if not self.SHOW_CAMERA:
-      return
-
-    try:
-      if not self._window_ready:
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        self._window_ready = True
-      cv2.imshow(window_name, image)
-      cv2.waitKey(1)
-    except Exception:
-      # Keep navigation running even if GUI backend is unavailable.
-      pass
+    cv2.destroyAllWindows()
 
   def _min_range(self, group_name, default=3.0):
     try:
@@ -84,7 +56,12 @@ class BrainFollowLine(Brain):
   def step(self):
     cv_image = self.robot.getImage()
 
-    self._show_camera("Stage Camera Image", cv_image)
+    # display the robot's camera's image using opencv
+    cv2.imshow("Stage Camera Image", cv_image)
+    cv2.waitKey(1)
+
+    # write the image to a file, for debugging etc.
+    cv2.imwrite("debug-capture.png", cv_image)
 
     # convert the image into grayscale
     imageGray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
@@ -93,21 +70,21 @@ class BrainFollowLine(Brain):
     foundLine,error = findLineDeviation(imageGray)
     print("findLineDeviation returned ",foundLine,error)
 
-    # Display a debug image with a green rectangle showing the detected line position.
+    # display a debug image using opencv
     middleRowIndex = cv_image.shape[1]//2
     centerColumnIndex = cv_image.shape[0]//2
-    debug_image = cv_image.copy()
     if (foundLine):
-      cv2.rectangle(debug_image,
+      cv2.rectangle(cv_image,
                     (int(error*middleRowIndex)+middleRowIndex-5,
                      centerColumnIndex-5),
                     (int(error*middleRowIndex)+middleRowIndex+5,
                      centerColumnIndex+5),
                     (0,255,0),
                     3)
-    self._show_camera("Debug findLineDeviation", debug_image)
+    cv2.imshow("Debug findLineDeviation", cv_image)
+    cv2.waitKey(1)
 
-    # Read front sonar groups to detect and avoid obstacles.
+    # Read front sensor groups to detect and avoid obstacles.
     front = self._min_range("front")
     front_left = self._min_range("front-left")
     front_right = self._min_range("front-right")
@@ -128,55 +105,46 @@ class BrainFollowLine(Brain):
       self.move(self.MED_FORWARD, self.MED_LEFT)
       return
 
-    # If no obstacle is near, follow the line.
+    # Line tracking with a PD controller
     if (foundLine):
+      # Reset lost line counter when the line is found
       self._lost_line_steps = 0
-      # Reset search direction based on current error so next loss is handled correctly.
-      self._search_dir = self.HARD_RIGHT if error >= 0 else self.HARD_LEFT
 
-      d_error = error - self._last_error
+      # PD Control
+      d_error = error - self.last_error
       turn = -(self.LINE_KP * error + self.LINE_KD * d_error)
 
-      # If error changes rapidly (overshooting), dampen the turn heavily.
-      if abs(d_error) > 0.15:
-        turn *= 0.4  # reduce by 60% to prevent overshoot
-
+      # Limit turn to max range
       turn = max(self.HARD_RIGHT, min(self.HARD_LEFT, turn))
-      self._last_error = error
 
-      abs_error = abs(error)
-      if abs_error > 0.55:
-        forward = self.NO_FORWARD       # pure pivot on sharp turns
-      elif abs_error > 0.40:
-        forward = self.SLOW_FORWARD
-      elif abs_error > 0.20:
-        forward = 0.7  # faster cruising
-      else:
-        forward = 1.0  # full speed on straight
+      # Saving last error for the next step
+      self.last_error = error
 
-      print(f"FOLLOW | error={error:.4f} d_error={d_error:.4f} turn={turn:.4f} forward={forward:.2f}")
+      # Forward speed
+      forward = max(self.VERY_SLOW_FORWARD, self.FULL_FORWARD - abs(turn * 1.5))
       self.move(forward, turn)
     else:
-      # Pendulum search for sharp bends including >90°.
       self._lost_line_steps += 1
+      if self._lost_line_steps == 1:
+        # Keep the direction based on error across multiple steps.
+        if self.last_error > 0:
+          self._search_dir = self.MED_RIGHT
+        elif self.last_error < 0:
+          self._search_dir = self.MED_LEFT
 
-      if (self._lost_line_steps == 1):
-        # First loss: commit to direction based on last known error.
-        self._search_dir = self.HARD_RIGHT if self._last_error >= 0 else self.HARD_LEFT
+      # If the line is lost for a few steps, starts searching it
+      if self._lost_line_steps < self.SEARCH_SLOW_AFTER:
+        self.move(self.SLOW_FORWARD, self._search_dir)
 
-      elif (self._lost_line_steps == self.PIVOT_REVERSE_AFTER + 1):
-        # Didn't find line in time: reverse direction (pendulum).
-        self._search_dir = self.HARD_LEFT if self._search_dir == self.HARD_RIGHT else self.HARD_RIGHT
+      # Slows down the turn if the line is lost for more steps.
+      elif self._lost_line_steps < self.SEARCH_REVERSE_AFTER:
+        self.move(self.VERY_SLOW_FORWARD, self._search_dir)
 
-      # Slow down pivot after a while to avoid overshooting the line.
-      if (self._lost_line_steps > self.PIVOT_SLOW_AFTER):
-        pivot_speed = abs(self._search_dir) * 0.5  # half rate
-        turn = pivot_speed if self._search_dir > 0 else -pivot_speed
+      # If the line is not found after many steps, switch search direction and reset counter
       else:
-        turn = self._search_dir
-
-      print(f"SEARCH | step={self._lost_line_steps} last_error={self._last_error:.4f} turn={turn:.4f} dir={self._search_dir:.2f}")
-      self.move(self.NO_FORWARD, turn)
+        self._search_dir *= -1
+        self._lost_line_steps = 0
+        self.move(self.VERY_SLOW_FORWARD, self._search_dir)
 
 def INIT(engine):
   assert (engine.robot.requires("range-sensor") and
