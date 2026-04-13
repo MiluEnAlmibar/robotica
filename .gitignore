@@ -2,3 +2,6 @@
 .vscode/
 __pycache__/
 *.pyc
+*.png
+*.avi
+*.mp4
