@@ -1,0 +1,176 @@
+define arrow model
+(
+  gui_nose 0
+  obstacle_return 0
+  gui_outline 0
+
+  block
+  (
+    points 7
+    point[0] [ 0.16 0 ]
+    point[1] [ 0.16 0.32 ]
+    point[2] [ 0 0.32 ]
+    point[3] [ 0.21 0.7 ]
+    point[4] [ 0.42 0.32 ]
+    point[5] [ 0.26 0.32 ]
+    point[6] [ 0.26 0 ]
+    z [ 0 0.001 ]
+  )
+)
+
+define box model
+(
+  size [0.5 0.5 0.5]
+  gui_nose 0
+)
+
+define sonarring ranger
+(
+  sensor
+  ( 			
+   range [ 0  3.0 ] # min and max range
+   fov 180 # front field of view
+   samples 8 # number of samples to return
+  )
+
+  # the visual rep of the ranger
+  color "black"
+  size [ 0.05 0.05 0.1 ]
+)
+
+define mycamera camera
+(
+  range [ 0.2 8.0 ]
+  resolution [ 320 240 ]
+  fov [ 53 40 ]
+  pantilt [ 0 50 ]
+  alwayson 1
+)
+
+define erratic position
+(
+  size [0.35 0.35 0.15]
+  origin [-0.05 0 0 0]
+  gui_nose 1
+  drive "diff"
+  sonarring(pose [ 0.050 0 0 0 ])
+  mycamera(pose [ .10 0 .35 90.0 ])
+)
+
+define ground model
+(
+  gui_nose 0
+  gui_grid 0
+  gui_outline 0
+  gripper_return 0
+  fiducial_return 0
+  obstacle_return 0
+)
+
+# set the resolution of the underlying raytrace model in meters
+resolution 0.02
+
+# simulation timestep in milliseconds
+interval_sim 100  
+
+window
+( 
+  size [ 500 550 ] 
+  rotate [ 0 0 ]
+  scale 60
+)
+
+ground
+( 
+  name "line"
+  color "blue"
+  bitmap "images/finalExam-202526-line1-v1.png"
+  # This is the size in metres of the simulation x y z (height)
+  size [7 7 0.001]
+  pose [ 0 0 0 0 ]
+  obstacle_return 0
+  gui_move 0
+  laser_return 0
+)
+
+ground
+( 
+  name "man"
+  color "red"
+  bitmap "images/man-v01.png"
+  size [ .1 .2 0.001]
+  pose [ 2.72 0.91 0 -2.38]
+  obstacle_return 0
+  laser_return 0
+)
+
+ground
+( 
+  name "telefone"
+  color "red"
+  bitmap "images/telephone-v01.png"
+  size [ .1 .2 0.001]
+  pose [ -3.23 -0.85 0 -39.51 ]
+  obstacle_return 0
+  laser_return 0
+)
+
+ground
+( 
+  name "stairs"
+  color "red"
+  bitmap "images/stairs-v01.png"
+  size [ .1 .2 0.001]
+  pose [ -2.20 -2.17 0 -90.97 ]
+  obstacle_return 0
+  laser_return 0
+)
+
+ground
+( 
+  name "woman"
+  color "red"
+  bitmap "images/woman-v01.png"
+  size [ .1 .2 0.001]
+  pose [ -0.12 0.86 0 14.80 ]
+  obstacle_return 0
+  laser_return 0
+)
+
+erratic( pose [ 2.83 -0.69 0 86.56 ] name "era" color "blue")
+
+# first turn
+arrow
+( 
+  name "arrow1" 
+  size [ .07 .2 0.001]
+  pose [ 0.16 3.34 0 132.62 ] 
+  color "red"
+)
+# second turn
+arrow
+( 
+  name "arrow2" 
+  size [ .07 .2 0.001]
+  pose [ -1.40 2.22 0 132.61 ] 
+  color "red"
+)
+# third turn
+arrow
+( 
+  name "arrow3" 
+  size [ .07 .2 0.001]
+  pose [ -2.54 1.05 0 -116.25] 
+  color "red"
+)
+# fourth turn
+arrow
+( 
+  name "arrow4" 
+  size [ .07 .2 0.001]
+  pose [ -0.03 -1.92 0 -5.40]
+  color "red"
+)
+
+# obstacle
+box( pose [ 0.08 -0.71 0 0.01 ] name "box1" color "gray30")
