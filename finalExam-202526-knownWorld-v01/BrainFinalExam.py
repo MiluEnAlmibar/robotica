@@ -446,11 +446,22 @@ class BrainFinalExam(Brain):
     SEARCH_SLOW_AFTER = 15
     SEARCH_REVERSE_AFTER = 35
 
+    # Memoria de cruce: una vez la flecha elige una salida, el robot se
+    # "compromete" con ella y la sigue aunque la flecha ya no se vea, hasta que
+    # vuelve a haber una sola linea centrada. Asi no escoge la rama al azar.
+    CROSS_COMMIT_STEPS = 22   # pasos que dura la memoria tras dejar de ver la flecha
+    CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
+
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
         self._lost_line_steps = 0
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
+
+        # Memoria del cruce en curso.
+        self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
+        self._cross_side = None        # lado de la salida elegida ('top'/'left'/'right')
+        self._cross_err = 0.0          # ultimo error conocido hacia esa salida (px)
 
         # Entrenar el clasificador de marcas desde la primera carpeta valida.
         self.knn = KNNMarcas(k=3)
@@ -566,24 +577,45 @@ class BrainFinalExam(Brain):
         err_px, x_linea, x_centro = error_seguimiento(m_linea, roi)
 
         m_marca_roi = aplicar_roi(m_marca, roi)
+        W = rgb.shape[1]
         arrow_info, salida = None, None
 
-        # PRIORIDAD 2: en un cruce, la flecha decide la salida (ruta conocida).
+        # Si vemos una flecha en un cruce, (re)memorizamos la salida elegida.
+        # Mientras la flecha sea visible se refresca la memoria; cuando deje de
+        # verse, el robot seguira comprometido con esa salida CROSS_COMMIT_STEPS
+        # pasos mas, de modo que NO escoge la rama al azar.
         if 'cruce' in escena and m_marca_roi.any():
             arrow_info = orientacion_flecha(mayor_blob(m_marca_roi))
             salida = salida_elegida(arrow_info, endpoints, roi)
+            if salida is not None:
+                self._cross_side = salida['side']
+                self._cross_err = salida['pt'][0] - x_centro
+                self._cross_steps = self.CROSS_COMMIT_STEPS
 
-        if salida is not None:
-            err_control = salida['pt'][0] - x_centro
-            forward, turn = self._control_pd(err_control, rgb.shape[1])
+        # PRIORIDAD 2: resolver el cruce usando la salida MEMORIZADA.
+        if self._cross_steps > 0:
+            self._cross_steps -= 1
+            # Si la salida elegida sigue visible, refresca el objetivo hacia ella.
+            sal_mem = next((e for e in endpoints
+                            if e['role'] == 'salida' and e['side'] == self._cross_side), None)
+            if sal_mem is not None:
+                self._cross_err = sal_mem['pt'][0] - x_centro
+            forward, turn = self._control_pd(self._cross_err, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("CRUCE  | %s -> salida=%s err=%.1f v=%.2f w=%.2f"
-                  % (escena, salida['side'], err_control, forward, turn))
+            print("CRUCE  | side=%s steps=%d err=%.1f v=%.2f w=%.2f"
+                  % (self._cross_side, self._cross_steps, self._cross_err, forward, turn))
+
+            # Libera la memoria cuando ya hay una sola linea (re)centrada: el
+            # robot ya esta encarrilado en la rama correcta.
+            if (escena in ('linea recta', 'curva izda', 'curva dcha')
+                    and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
+                self._cross_steps = 0
+                self._cross_side = None
 
         # PRIORIDAD 3: seguir la linea (PD sobre el error de segmentacion).
         elif err_px is not None:
-            forward, turn = self._control_pd(err_px, rgb.shape[1])
+            forward, turn = self._control_pd(err_px, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
             print("FOLLOW | %s err=%.1f v=%.2f w=%.2f" % (escena, err_px, forward, turn))
@@ -601,8 +633,7 @@ class BrainFinalExam(Brain):
             if _HAS_FOLLOWLINE:
                 found, err_fl = findLineDeviation(gray)
                 if found:
-                    forward, turn = self._control_pd(err_fl * (rgb.shape[1] / 2.0),
-                                                     rgb.shape[1])
+                    forward, turn = self._control_pd(err_fl * (W / 2.0), W)
                     self._lost_line_steps = 0
                     self.move(forward, turn)
                     print("FOLLOW(fallback) | err=%.3f v=%.2f w=%.2f"
@@ -631,8 +662,17 @@ class BrainFinalExam(Brain):
                 cv2.circle(vis, e['pt'], 5, color, -1)
             if salida is not None:
                 cv2.circle(vis, salida['pt'], 9, (0, 255, 255), 2)
+            # Flecha estimada: centroide -> punta (en coords globales).
+            if arrow_info is not None:
+                cx, cy, tx, ty = arrow_info
+                cv2.arrowedLine(vis, (int(cx + x0), int(cy + y0)),
+                                (int(tx + x0), int(ty + y0)),
+                                (0, 200, 255), 2, tipLength=0.3)
             cv2.putText(vis, str(escena), (5, 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            if self._cross_steps > 0:
+                cv2.putText(vis, "COMMIT %s (%d)" % (self._cross_side, self._cross_steps),
+                            (5, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         cv2.imshow("FinalExam", vis)
         cv2.waitKey(1)
 
