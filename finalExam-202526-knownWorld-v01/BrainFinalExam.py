@@ -240,33 +240,48 @@ def orientacion_flecha(m_marca_roi, area_min=30):
     return float(cx), float(cy), float(px_idx[tip]), float(py_idx[tip])
 
 
-def salida_elegida(arrow_info, endpoints, roi):
-    """Salida cuya direccion (desde el centroide) mejor coincide con centroide->punta."""
-    if arrow_info is None:
-        return None
-    y0, y1, x0, x1 = roi
-    cx, cy, tx, ty = arrow_info
-
-    vx, vy = tx - cx, ty - cy
-    n_v = np.hypot(vx, vy)
-    if n_v < 1e-6:
-        return None
-    vx, vy = vx / n_v, vy / n_v
-
-    cx_g, cy_g = cx + x0, cy + y0
+def salida_de_label(endpoints, label, xc):
+    """Mapea una etiqueta de direccion ('left'/'straight'/'right') a la salida
+    concreta entre los endpoints actuales. Devuelve el dict de salida o None."""
     salidas = [e for e in endpoints if e['role'] == 'salida']
     if not salidas:
         return None
+    if label == 'left':
+        return min(salidas, key=lambda e: e['pt'][0])       # salida mas a la izda
+    if label == 'right':
+        return max(salidas, key=lambda e: e['pt'][0])       # salida mas a la dcha
+    # 'straight': salida mas centrada, prefiriendo la del borde superior.
+    tops = [e for e in salidas if e['side'] == 'top']
+    cand = tops if tops else salidas
+    return min(cand, key=lambda e: abs(e['pt'][0] - xc))
 
-    def cos_ang(s):
-        sx, sy = s['pt']
-        ddx, ddy = sx - cx_g, sy - cy_g
-        n = np.hypot(ddx, ddy)
-        if n < 1e-6:
-            return -2.0
-        return (ddx * vx + ddy * vy) / n
 
-    return max(salidas, key=cos_ang)
+def salida_por_flecha(arrow_info, endpoints, roi, deadzone_deg=35.0):
+    """Decide la salida en un cruce a partir de la inclinacion de la flecha.
+
+    En vez de la similitud de coseno (fragil cuando la flecha se ve parcial),
+    clasificamos la flecha en 'left' / 'straight' / 'right' segun cuanto se
+    inclina respecto a la vertical de la imagen, con una zona muerta amplia a
+    favor de 'recto'. Asi una flecha casi vertical (recta), aunque se vea a
+    medias, no se confunde con una salida lateral.
+
+    Devuelve (salida_dict, label) o (None, 'none')."""
+    if arrow_info is None:
+        return None, 'none'
+    cx, cy, tx, ty = arrow_info
+    vx, vy = tx - cx, ty - cy
+    # Inclinacion respecto a la vertical (0 = vertical/recto, 90 = horizontal).
+    # Usamos valores absolutos para ignorar el signo (la punta puede salir hacia
+    # arriba o hacia abajo segun el recorte del blob).
+    lean = np.degrees(np.arctan2(abs(vx), abs(vy) + 1e-9))
+    if lean < deadzone_deg:
+        label = 'straight'
+    elif vx < 0:
+        label = 'left'
+    else:
+        label = 'right'
+    xc = (roi[2] + roi[3]) / 2.0
+    return salida_de_label(endpoints, label, xc), label
 
 
 def error_seguimiento(m_linea, roi, alto_franja=15):
@@ -430,9 +445,10 @@ class BrainFinalExam(Brain):
     MED_RIGHT = -0.5
     HARD_RIGHT = -1.0
 
-    # Evasion de obstaculos con sonar.
-    OBSTACLE_STOP = 0.30
-    OBSTACLE_WARN = 0.60
+    # Evasion de obstaculos con sonar (el robot mide ~0.35 m).
+    OBSTACLE_BACK = 0.32   # muy cerca de frente -> retroceder girando
+    OBSTACLE_STOP = 0.50   # cerca de frente    -> girar en el sitio (sin avanzar)
+    OBSTACLE_WARN = 0.75   # aviso lateral      -> esquivar despacio
 
     # Ganancias del control PD de seguimiento (como BrainFollowLine).
     LINE_KP = 0.9
@@ -451,6 +467,7 @@ class BrainFinalExam(Brain):
     # vuelve a haber una sola linea centrada. Asi no escoge la rama al azar.
     CROSS_COMMIT_STEPS = 22   # pasos que dura la memoria tras dejar de ver la flecha
     CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
+    STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta"
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
@@ -462,6 +479,8 @@ class BrainFinalExam(Brain):
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
         self._cross_side = None        # lado de la salida elegida ('top'/'left'/'right')
         self._cross_err = 0.0          # ultimo error conocido hacia esa salida (px)
+        self._cross_best_area = 0      # mayor area de flecha vista en este cruce
+        self._cross_label = 'none'     # 'left'/'straight'/'right' decidido
 
         # Entrenar el clasificador de marcas desde la primera carpeta valida.
         self.knn = KNNMarcas(k=3)
@@ -490,22 +509,34 @@ class BrainFinalExam(Brain):
         return min(distances) if distances else default
 
     def _avoid_obstacle(self):
-        """Devuelve True si ha tomado el control por un obstaculo."""
+        """Devuelve True si ha tomado el control por un obstaculo.
+
+        Clave para no chocar: cuando hay algo de FRENTE no se avanza. Se gira en
+        el sitio (o se retrocede girando si esta muy cerca) hacia el lado mas
+        libre; solo se avanza despacio en la zona de aviso lateral."""
         front = self._min_range("front")
         front_left = self._min_range("front-left")
         front_right = self._min_range("front-right")
+        libre = self.HARD_RIGHT if front_left < front_right else self.HARD_LEFT
 
-        if front < self.OBSTACLE_STOP:
-            if front_left < front_right:
-                self.move(self.SLOW_FORWARD, self.MED_RIGHT)
-            else:
-                self.move(self.SLOW_FORWARD, self.MED_LEFT)
+        # Muy cerca de frente: retroceder girando para alejarse sin chocar.
+        if front < self.OBSTACLE_BACK:
+            self.move(-self.SLOW_FORWARD, libre)
+            print("AVOID  | muy cerca front=%.2f -> retrocede gira %.1f" % (front, libre))
             return True
+
+        # Cerca de frente: girar EN EL SITIO (sin avanzar) hacia el lado libre.
+        if front < self.OBSTACLE_STOP:
+            self.move(self.NO_FORWARD, libre)
+            print("AVOID  | cerca front=%.2f -> gira en sitio %.1f" % (front, libre))
+            return True
+
+        # Aviso lateral: esquivar despacio mientras avanza.
         if front_left < self.OBSTACLE_WARN:
-            self.move(self.MED_FORWARD, self.MED_RIGHT)
+            self.move(self.SLOW_FORWARD, self.MED_RIGHT)
             return True
         if front_right < self.OBSTACLE_WARN:
-            self.move(self.MED_FORWARD, self.MED_LEFT)
+            self.move(self.SLOW_FORWARD, self.MED_LEFT)
             return True
         return False
 
@@ -580,31 +611,42 @@ class BrainFinalExam(Brain):
         W = rgb.shape[1]
         arrow_info, salida = None, None
 
-        # Si vemos una flecha en un cruce, (re)memorizamos la salida elegida.
-        # Mientras la flecha sea visible se refresca la memoria; cuando deje de
-        # verse, el robot seguira comprometido con esa salida CROSS_COMMIT_STEPS
-        # pasos mas, de modo que NO escoge la rama al azar.
+        # Si vemos una flecha en un cruce, decidimos la direccion (left/straight/
+        # right). La decision se FIJA con la mejor vista de la flecha (la de mayor
+        # area), no con cualquier frame parcial, para no salir por una lateral en
+        # un cruce recto solo porque la flecha se vea a medias. Mientras la flecha
+        # sea visible se refresca la memoria; al perderla, el robot sigue
+        # comprometido CROSS_COMMIT_STEPS pasos mas, asi NO escoge la rama al azar.
         if 'cruce' in escena and m_marca_roi.any():
-            arrow_info = orientacion_flecha(mayor_blob(m_marca_roi))
-            salida = salida_elegida(arrow_info, endpoints, roi)
+            blob = mayor_blob(m_marca_roi)
+            arrow_info = orientacion_flecha(blob)
+            salida, label = salida_por_flecha(arrow_info, endpoints, roi,
+                                              self.STRAIGHT_DEADZONE_DEG)
             if salida is not None:
+                area = int(blob.sum())
+                if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
+                    self._cross_best_area = 0
+                if area >= self._cross_best_area:    # solo la mejor vista fija la direccion
+                    self._cross_best_area = area
+                    self._cross_label = label
                 self._cross_side = salida['side']
-                self._cross_err = salida['pt'][0] - x_centro
                 self._cross_steps = self.CROSS_COMMIT_STEPS
 
-        # PRIORIDAD 2: resolver el cruce usando la salida MEMORIZADA.
+        # PRIORIDAD 2: resolver el cruce usando la direccion MEMORIZADA.
         if self._cross_steps > 0:
             self._cross_steps -= 1
-            # Si la salida elegida sigue visible, refresca el objetivo hacia ella.
-            sal_mem = next((e for e in endpoints
-                            if e['role'] == 'salida' and e['side'] == self._cross_side), None)
+            # Reproyecta la direccion fijada sobre los endpoints actuales (sigue
+            # funcionando aunque la flecha ya no se vea).
+            sal_mem = salida_de_label(endpoints, self._cross_label, x_centro)
             if sal_mem is not None:
                 self._cross_err = sal_mem['pt'][0] - x_centro
+                self._cross_side = sal_mem['side']
             forward, turn = self._control_pd(self._cross_err, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("CRUCE  | side=%s steps=%d err=%.1f v=%.2f w=%.2f"
-                  % (self._cross_side, self._cross_steps, self._cross_err, forward, turn))
+            print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
+                  % (self._cross_label, self._cross_side, self._cross_steps,
+                     self._cross_err, forward, turn))
 
             # Libera la memoria cuando ya hay una sola linea (re)centrada: el
             # robot ya esta encarrilado en la rama correcta.
@@ -612,6 +654,7 @@ class BrainFinalExam(Brain):
                     and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
                 self._cross_steps = 0
                 self._cross_side = None
+                self._cross_label = 'none'
 
         # PRIORIDAD 3: seguir la linea (PD sobre el error de segmentacion).
         elif err_px is not None:
@@ -671,7 +714,8 @@ class BrainFinalExam(Brain):
             cv2.putText(vis, str(escena), (5, 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             if self._cross_steps > 0:
-                cv2.putText(vis, "COMMIT %s (%d)" % (self._cross_side, self._cross_steps),
+                cv2.putText(vis, "COMMIT %s->%s (%d)"
+                            % (self._cross_label, self._cross_side, self._cross_steps),
                             (5, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         cv2.imshow("FinalExam", vis)
         cv2.waitKey(1)
