@@ -445,10 +445,15 @@ class BrainFinalExam(Brain):
     MED_RIGHT = -0.5
     HARD_RIGHT = -1.0
 
-    # Evasion de obstaculos con sonar (el robot mide ~0.35 m).
+    # Evasion de obstaculos con sonar (el robot mide ~0.35 m). Solo la caja
+    # devuelve laser; la linea y las marcas no, asi que el sonar solo "ve" el
+    # obstaculo. Al detectarlo se hace un RODEO (orbita) hasta reencontrar la
+    # linea, en vez de girar en el sitio y volver a meterse en la caja.
     OBSTACLE_BACK = 0.32   # muy cerca de frente -> retroceder girando
-    OBSTACLE_STOP = 0.50   # cerca de frente    -> girar en el sitio (sin avanzar)
-    OBSTACLE_WARN = 0.75   # aviso lateral      -> esquivar despacio
+    OBSTACLE_STOP = 0.55   # algo de frente      -> empieza/continua el rodeo
+    DETOUR_HUG = 0.35      # giro suave de vuelta hacia el obstaculo al orbitarlo
+    DETOUR_LINE_OK_PX = 60 # se sale del rodeo cuando la linea vuelve centrada
+    DETOUR_MAX_STEPS = 90  # seguridad: no orbitar indefinidamente
 
     # Ganancias del control PD de seguimiento (como BrainFollowLine).
     LINE_KP = 0.9
@@ -482,6 +487,10 @@ class BrainFinalExam(Brain):
         self._cross_best_area = 0      # mayor area de flecha vista en este cruce
         self._cross_label = 'none'     # 'left'/'straight'/'right' decidido
 
+        # Estado del rodeo de obstaculo.
+        self._detour_dir = 0           # 0 = sin rodeo; +1 = rodear por izda, -1 = dcha
+        self._detour_steps = 0         # pasos dentro del rodeo actual
+
         # Entrenar el clasificador de marcas desde la primera carpeta valida.
         self.knn = KNNMarcas(k=3)
         for cand in MARCAS_DIR_CANDIDATAS:
@@ -508,37 +517,57 @@ class BrainFinalExam(Brain):
         distances = [s.distance() for s in sensors if s is not None]
         return min(distances) if distances else default
 
-    def _avoid_obstacle(self):
-        """Devuelve True si ha tomado el control por un obstaculo.
+    def _avoid_obstacle(self, err_px):
+        """Rodea el obstaculo (orbita) hasta reencontrar la linea. Devuelve True
+        mientras tenga el control.
 
-        Clave para no chocar: cuando hay algo de FRENTE no se avanza. Se gira en
-        el sitio (o se retrocede girando si esta muy cerca) hacia el lado mas
-        libre; solo se avanza despacio en la zona de aviso lateral."""
+        - Si no hay nada de frente y no estamos rodeando -> False (sigue la linea).
+        - Al detectar la caja se fija un sentido de rodeo (hacia el lado mas
+          libre) y se mantiene: se gira en el sitio cuando esta cerca y se
+          avanza bordeandola (curva suave de vuelta) cuando el frente se despeja.
+        - Se sale del rodeo cuando la linea vuelve a verse CENTRADA (|err| < umbral)
+          o por seguridad tras DETOUR_MAX_STEPS pasos."""
         front = self._min_range("front")
-        front_left = self._min_range("front-left")
-        front_right = self._min_range("front-right")
-        libre = self.HARD_RIGHT if front_left < front_right else self.HARD_LEFT
+        fl = self._min_range("front-left")
+        fr = self._min_range("front-right")
 
-        # Muy cerca de frente: retroceder girando para alejarse sin chocar.
-        if front < self.OBSTACLE_BACK:
-            self.move(-self.SLOW_FORWARD, libre)
-            print("AVOID  | muy cerca front=%.2f -> retrocede gira %.1f" % (front, libre))
-            return True
+        blocked = front < self.OBSTACLE_STOP
+        very_close = front < self.OBSTACLE_BACK
 
-        # Cerca de frente: girar EN EL SITIO (sin avanzar) hacia el lado libre.
-        if front < self.OBSTACLE_STOP:
-            self.move(self.NO_FORWARD, libre)
-            print("AVOID  | cerca front=%.2f -> gira en sitio %.1f" % (front, libre))
-            return True
+        if self._detour_dir == 0:
+            if not blocked:
+                return False
+            self._detour_dir = 1 if fl > fr else -1   # rodear por el lado mas libre
+            self._detour_steps = 0
+            print("DETOUR | inicio dir=%s front=%.2f"
+                  % ("izda" if self._detour_dir > 0 else "dcha", front))
 
-        # Aviso lateral: esquivar despacio mientras avanza.
-        if front_left < self.OBSTACLE_WARN:
-            self.move(self.SLOW_FORWARD, self.MED_RIGHT)
-            return True
-        if front_right < self.OBSTACLE_WARN:
-            self.move(self.SLOW_FORWARD, self.MED_LEFT)
-            return True
-        return False
+        self._detour_steps += 1
+        away = self.HARD_LEFT if self._detour_dir > 0 else self.HARD_RIGHT
+        hug = -self.DETOUR_HUG * self._detour_dir   # giro suave de vuelta al obstaculo
+
+        if very_close:
+            self.move(-self.SLOW_FORWARD, away)       # retroceder girando
+            print("DETOUR | muy cerca front=%.2f retrocede" % front)
+        elif blocked:
+            self.move(self.NO_FORWARD, away)          # girar en el sitio (sin avanzar)
+            print("DETOUR | cerca front=%.2f gira en sitio" % front)
+        else:
+            self.move(self.MED_FORWARD, hug)          # bordear el obstaculo
+            print("DETOUR | bordeando front=%.2f steps=%d err=%s"
+                  % (front, self._detour_steps,
+                     "%.0f" % err_px if err_px is not None else "-"))
+            # Salir cuando la linea vuelve a verse centrada.
+            if err_px is not None and abs(err_px) < self.DETOUR_LINE_OK_PX:
+                print("DETOUR | linea reencontrada -> fin")
+                self._detour_dir = 0
+                return False
+
+        if self._detour_steps > self.DETOUR_MAX_STEPS:
+            print("DETOUR | timeout -> fin")
+            self._detour_dir = 0
+            return False
+        return True
 
     # --- control PD ------------------------------------------------------
     def _control_pd(self, error_px, W):
@@ -592,14 +621,8 @@ class BrainFinalExam(Brain):
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB) if CAMERA_RETURNS_BGR else cv_image
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        # PRIORIDAD 1: evitar colisiones.
-        if self._avoid_obstacle():
-            if DEBUG_VIEW:
-                self._mostrar(cv_image, None, None)
-            print("AVOID | obstaculo detectado")
-            return
-
-        # PERCEPCION: segmentar y analizar la escena.
+        # PERCEPCION: segmentar y analizar la escena (antes que la evasion, para
+        # que el rodeo sepa cuando la linea vuelve a estar centrada).
         roi = get_roi(rgb.shape)
         etiquetas = segmentar(rgb)
         m_linea, m_marca = mascaras(etiquetas)
@@ -610,6 +633,16 @@ class BrainFinalExam(Brain):
         m_marca_roi = aplicar_roi(m_marca, roi)
         W = rgb.shape[1]
         arrow_info, salida = None, None
+
+        # PRIORIDAD 1: evitar/rodear el obstaculo. Mientras se rodea, se abandona
+        # cualquier compromiso de cruce (el robot reorienta y ese compromiso ya
+        # no tiene sentido: provocaba que tras esquivar girase al lado contrario).
+        if self._avoid_obstacle(err_px):
+            self._cross_steps = 0
+            self._cross_label = 'none'
+            if DEBUG_VIEW:
+                self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
+            return
 
         # Si vemos una flecha en un cruce, decidimos la direccion (left/straight/
         # right). La decision se FIJA con la mejor vista de la flecha (la de mayor
@@ -635,12 +668,19 @@ class BrainFinalExam(Brain):
         # PRIORIDAD 2: resolver el cruce usando la direccion MEMORIZADA.
         if self._cross_steps > 0:
             self._cross_steps -= 1
-            # Reproyecta la direccion fijada sobre los endpoints actuales (sigue
-            # funcionando aunque la flecha ya no se vea).
+            # Reproyecta la direccion fijada sobre los endpoints actuales, pero
+            # SOLO si es coherente con el sentido comprometido. Asi 'left' siempre
+            # gira a la izda (err<0) aunque una reproyeccion espuria diera err>0
+            # (lo que antes hacia que se fuera al lado contrario).
             sal_mem = salida_de_label(endpoints, self._cross_label, x_centro)
             if sal_mem is not None:
-                self._cross_err = sal_mem['pt'][0] - x_centro
-                self._cross_side = sal_mem['side']
+                new_err = sal_mem['pt'][0] - x_centro
+                coherente = (self._cross_label == 'straight'
+                             or (self._cross_label == 'left' and new_err < 0)
+                             or (self._cross_label == 'right' and new_err > 0))
+                if coherente:
+                    self._cross_err = new_err
+                    self._cross_side = sal_mem['side']
             forward, turn = self._control_pd(self._cross_err, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
