@@ -300,21 +300,6 @@ def error_seguimiento(m_linea, roi, alto_franja=15):
     return xs.mean() - W / 2.0, xs.mean(), W / 2.0
 
 
-def fila_cruce(m_linea, roi, min_px=100):
-    """Progreso vertical (0 = lejos/arriba, 1 = cerca/abajo del robot) de la fila
-    de cruce mas cercana dentro de la ROI: la fila MAS BAJA cuya cantidad de
-    pixeles de linea supera min_px (tipicamente la linea transversal de un cruce,
-    mucho mas ancha que la linea normal). Sirve para saber cuando el robot esta
-    ya ENCIMA del cruce. Devuelve None si no hay ninguna fila asi."""
-    y0, y1, x0, x1 = roi
-    sub = m_linea[y0:y1, :]
-    counts = sub.sum(axis=1)
-    filas = np.where(counts > min_px)[0]
-    if len(filas) == 0:
-        return None
-    return float(filas.max()) / max(1, sub.shape[0] - 1)
-
-
 # =============================================================================
 # CLASIFICADOR DE MARCAS  (Hu Moments + KNN, de 02_analisis_escena.ipynb #11)
 # =============================================================================
@@ -489,22 +474,14 @@ class BrainFinalExam(Brain):
     CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
     STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta"
 
-    # El giro se hace ENCIMA del cruce, no antes: durante la aproximacion se va
-    # recto hasta que la fila transversal del cruce baja a la zona inferior.
-    CROSS_ROW_MIN_PX = 100    # una fila de linea con mas pixeles que esto = cruce
-    TURN_TRIGGER = 0.60       # se gira cuando esa fila baja al 60% inferior de la ROI
-    APPROACH_MAX_STEPS = 40   # seguridad: no aproximar recto indefinidamente
-
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
         self._lost_line_steps = 0
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
 
-        # Memoria/estado del cruce en curso.
-        self._cross_phase = 0          # 0 = ninguno, 1 = aproximacion (recto), 2 = giro
-        self._approach_steps = 0       # pasos en fase de aproximacion
-        self._cross_steps = 0          # pasos restantes del giro comprometido
+        # Memoria del cruce en curso.
+        self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
         self._cross_side = None        # lado de la salida elegida ('top'/'left'/'right')
         self._cross_err = 0.0          # ultimo error conocido hacia esa salida (px)
         self._cross_best_area = 0      # mayor area de flecha vista en este cruce
@@ -661,64 +638,40 @@ class BrainFinalExam(Brain):
         # cualquier compromiso de cruce (el robot reorienta y ese compromiso ya
         # no tiene sentido: provocaba que tras esquivar girase al lado contrario).
         if self._avoid_obstacle(err_px):
-            self._cross_phase = 0
             self._cross_steps = 0
             self._cross_label = 'none'
             if DEBUG_VIEW:
                 self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
             return
 
-        # Si vemos una flecha en un cruce, memorizamos la direccion (left/straight/
-        # right) y entramos en fase de APROXIMACION. La direccion se FIJA con la
-        # mejor vista de la flecha (la de mayor area), no con un frame parcial.
-        # Clave de esta estrategia: NO se gira al ver la flecha de lejos; se sigue
-        # RECTO hasta estar ENCIMA del cruce y solo entonces se ejecuta el giro,
-        # para tomar la linea de frente y esquivar el obstaculo con mas margen.
+        # Si vemos una flecha en un cruce, decidimos la direccion (left/straight/
+        # right). La decision se FIJA con la mejor vista de la flecha (la de mayor
+        # area), no con cualquier frame parcial, para no salir por una lateral en
+        # un cruce recto solo porque la flecha se vea a medias. Mientras la flecha
+        # sea visible se refresca la memoria; al perderla, el robot sigue
+        # comprometido CROSS_COMMIT_STEPS pasos mas, asi NO escoge la rama al azar.
         if 'cruce' in escena and m_marca_roi.any():
             blob = mayor_blob(m_marca_roi)
             arrow_info = orientacion_flecha(blob)
             salida, label = salida_por_flecha(arrow_info, endpoints, roi,
                                               self.STRAIGHT_DEADZONE_DEG)
             if salida is not None:
-                if self._cross_phase == 0:           # cruce nuevo: entra en APPROACH
-                    self._cross_phase = 1
+                area = int(blob.sum())
+                if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
                     self._cross_best_area = 0
-                    self._approach_steps = 0
-                if self._cross_phase == 1:           # solo la mejor vista fija la direccion
-                    area = int(blob.sum())
-                    if area >= self._cross_best_area:
-                        self._cross_best_area = area
-                        self._cross_label = label
+                if area >= self._cross_best_area:    # solo la mejor vista fija la direccion
+                    self._cross_best_area = area
+                    self._cross_label = label
                 self._cross_side = salida['side']
-
-        # PRIORIDAD 2a: APROXIMACION -> ir RECTO siguiendo la linea de entrada
-        # hasta que el cruce baje a la parte inferior de la imagen (robot encima).
-        if self._cross_phase == 1:
-            self._approach_steps += 1
-            prog = fila_cruce(m_linea, roi, self.CROSS_ROW_MIN_PX)
-            if err_px is not None:
-                forward, turn = self._control_pd(err_px, W)
-            else:
-                forward, turn = self.SLOW_FORWARD, self.NO_TURN
-            self._lost_line_steps = 0
-            self.move(forward, turn)
-            print("APPROACH| %s prog=%s err=%s v=%.2f w=%.2f"
-                  % (self._cross_label,
-                     "%.2f" % prog if prog is not None else "-",
-                     "%.0f" % err_px if err_px is not None else "-", forward, turn))
-            # Transicion a GIRO cuando el cruce esta encima (o por seguridad).
-            if ((prog is not None and prog >= self.TURN_TRIGGER)
-                    or self._approach_steps > self.APPROACH_MAX_STEPS):
-                self._cross_phase = 2
                 self._cross_steps = self.CROSS_COMMIT_STEPS
-                self._cross_err = 0.0
 
-        # PRIORIDAD 2b: GIRO -> ejecutar el giro comprometido encima del cruce.
-        elif self._cross_phase == 2:
+        # PRIORIDAD 2: resolver el cruce usando la direccion MEMORIZADA.
+        if self._cross_steps > 0:
             self._cross_steps -= 1
             # Reproyecta la direccion fijada sobre los endpoints actuales, pero
-            # SOLO si es coherente con el sentido comprometido (asi 'left' siempre
-            # gira a la izda aunque una reproyeccion espuria diera err>0).
+            # SOLO si es coherente con el sentido comprometido. Asi 'left' siempre
+            # gira a la izda (err<0) aunque una reproyeccion espuria diera err>0
+            # (lo que antes hacia que se fuera al lado contrario).
             sal_mem = salida_de_label(endpoints, self._cross_label, x_centro)
             if sal_mem is not None:
                 new_err = sal_mem['pt'][0] - x_centro
@@ -731,14 +684,14 @@ class BrainFinalExam(Brain):
             forward, turn = self._control_pd(self._cross_err, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("TURN   | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
+            print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
                   % (self._cross_label, self._cross_side, self._cross_steps,
                      self._cross_err, forward, turn))
-            # Termina cuando hay una sola linea (re)centrada o se agota el commit.
-            if (self._cross_steps <= 0
-                    or (escena in ('linea recta', 'curva izda', 'curva dcha')
-                        and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX)):
-                self._cross_phase = 0
+
+            # Libera la memoria cuando ya hay una sola linea (re)centrada: el
+            # robot ya esta encarrilado en la rama correcta.
+            if (escena in ('linea recta', 'curva izda', 'curva dcha')
+                    and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
                 self._cross_steps = 0
                 self._cross_side = None
                 self._cross_label = 'none'
@@ -800,11 +753,8 @@ class BrainFinalExam(Brain):
                                 (0, 200, 255), 2, tipLength=0.3)
             cv2.putText(vis, str(escena), (5, 15),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            if self._cross_phase == 1:
-                cv2.putText(vis, "APPROACH %s" % self._cross_label,
-                            (5, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            elif self._cross_phase == 2:
-                cv2.putText(vis, "TURN %s->%s (%d)"
+            if self._cross_steps > 0:
+                cv2.putText(vis, "COMMIT %s->%s (%d)"
                             % (self._cross_label, self._cross_side, self._cross_steps),
                             (5, 33), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         cv2.imshow("FinalExam", vis)
