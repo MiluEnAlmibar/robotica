@@ -22,13 +22,7 @@ import os
 import numpy as np
 import cv2
 
-# findLineDeviation se usa SOLO como red de seguridad si la segmentacion no
-# encuentra la linea. Si no esta disponible, no pasa nada.
-try:
-    from pyrobot.tools.followLineTools import findLineDeviation
-    _HAS_FOLLOWLINE = True
-except Exception:
-    _HAS_FOLLOWLINE = False
+from pyrobot.tools.followLineTools import findLineDeviation
 
 
 # =============================================================================
