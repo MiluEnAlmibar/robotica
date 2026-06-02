@@ -494,9 +494,9 @@ class BrainFinalExam(Brain):
     SEARCH_SLOW_AFTER = 15
     SEARCH_REVERSE_AFTER = 35
 
-    CROSS_COMMIT_STEPS = 22
-    CROSS_RELEASE_PX = 45
-    STRAIGHT_DEADZONE_DEG = 35
+    CROSS_COMMIT_STEPS = 30   # pasos maximos de giro (liberacion anticipada si linea aparece en el lado correcto)
+    CROSS_RELEASE_PX = 60      # umbral (px): libera 'straight'; para lateral, se usa CROSS_RELEASE_PX//2
+    STRAIGHT_DEADZONE_DEG = 20  # zona muerta mas estrecha: 90° left no se confunde con recto
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
@@ -705,18 +705,43 @@ class BrainFinalExam(Brain):
                 if coherente:
                     self._cross_err = new_err
                     self._cross_side = sal_mem['side']
-            forward, turn = self._control_pd(self._cross_err, W)
+
+            # Para giros laterales (90°) forzamos giro DURO con velocidad reducida.
+            # El PD solo se usa en 'straight' donde la salida esta casi centrada.
+            if self._cross_label == 'left':
+                forward, turn = self.SLOW_FORWARD, self.HARD_LEFT
+            elif self._cross_label == 'right':
+                forward, turn = self.SLOW_FORWARD, self.HARD_RIGHT
+            else:
+                forward, turn = self._control_pd(self._cross_err, W)
+
             self._lost_line_steps = 0
             self.move(forward, turn)
             if not PRINT_ONLY_MARCA:
                 print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
                       % (self._cross_label, self._cross_side, self._cross_steps,
                          self._cross_err, forward, turn))
-            if (escena in ('linea recta', 'curva izda', 'curva dcha')
-                    and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
-                self._cross_steps = 0
-                self._cross_side = None
-                self._cross_label = 'none'
+
+            # Liberacion del cruce: diferenciamos por direccion.
+            # - 'straight': se libera cuando la linea esta centrada (comportamiento original).
+            # - 'left'/'right': la condicion abs(err)<umbral tambien se cumple con
+            #   la rama RECTA mientras el robot gira -> liberacion prematura.
+            #   Solo liberamos cuando la linea esta del lado correcto (el giro termino).
+            if escena in ('linea recta', 'curva izda', 'curva dcha') and err_px is not None:
+                if self._cross_label == 'straight' and abs(err_px) < self.CROSS_RELEASE_PX:
+                    self._cross_steps = 0
+                    self._cross_side = None
+                    self._cross_label = 'none'
+                elif self._cross_label == 'left' and err_px < -self.CROSS_RELEASE_PX // 2:
+                    # linea ya a la izquierda y escena simple -> giro completado
+                    self._cross_steps = 0
+                    self._cross_side = None
+                    self._cross_label = 'none'
+                elif self._cross_label == 'right' and err_px > self.CROSS_RELEASE_PX // 2:
+                    # linea ya a la derecha y escena simple -> giro completado
+                    self._cross_steps = 0
+                    self._cross_side = None
+                    self._cross_label = 'none'
 
         # PRIORIDAD 3: seguir la linea (PD sobre el error de segmentacion).
         elif err_px is not None:
