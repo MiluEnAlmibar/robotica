@@ -154,18 +154,25 @@ def runs_in_border(border_pixels):
     return runs
 
 
-def endpoints_en_roi(m_linea, roi):
+def endpoints_en_roi(m_linea, roi, grosor=4):
     """Endpoints donde la linea cruza los 4 bordes de la ROI.
-    Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}."""
+    Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}.
+
+    Cada borde se mira como una BANDA de `grosor` pixeles (no una sola linea):
+    basta con que haya pixel de linea en cualquier fila/columna de la banda para
+    contar el cruce. Asi una rama que no llega justo al pixel del borde, o con
+    pequenos huecos de segmentacion, sigue generando endpoint (antes era muy
+    fragil y no se detectaba el cruce)."""
     y0, y1, x0, x1 = roi
     sub = m_linea[y0:y1, x0:x1]
     H, W = sub.shape
+    g = max(1, min(grosor, H // 2, W // 2))
 
     borders = [
-        ('bottom', sub[H - 1, :], lambda m: (x0 + m, y0 + H - 1), 'entrada'),
-        ('top',    sub[0, :],     lambda m: (x0 + m, y0),         'salida'),
-        ('left',   sub[:, 0],     lambda m: (x0, y0 + m),         'salida'),
-        ('right',  sub[:, W - 1], lambda m: (x0 + W - 1, y0 + m), 'salida'),
+        ('bottom', sub[H - g:, :].any(axis=0), lambda m: (x0 + m, y0 + H - 1), 'entrada'),
+        ('top',    sub[:g, :].any(axis=0),     lambda m: (x0 + m, y0),         'salida'),
+        ('left',   sub[:, :g].any(axis=1),     lambda m: (x0, y0 + m),         'salida'),
+        ('right',  sub[:, W - g:].any(axis=1), lambda m: (x0 + W - 1, y0 + m), 'salida'),
     ]
 
     endpoints = []
