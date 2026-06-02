@@ -584,7 +584,6 @@ class BrainFinalExam(Brain):
     def step(self):
         cv_image = self.robot.getImage()
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB) if CAMERA_RETURNS_BGR else cv_image
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
         # PERCEPCION: segmentar y analizar la escena (antes que la evasion, para
         # que el rodeo sepa cuando la linea vuelve a estar centrada).
@@ -677,17 +676,7 @@ class BrainFinalExam(Brain):
 
         # PRIORIDAD 4: red de seguridad con findLineDeviation, luego buscar.
         else:
-            found = False
-            if _HAS_FOLLOWLINE:
-                found, err_fl = findLineDeviation(gray)
-                if found:
-                    forward, turn = self._control_pd(err_fl * (W / 2.0), W)
-                    self._lost_line_steps = 0
-                    self.move(forward, turn)
-                    print("FOLLOW(fallback) | err=%.3f v=%.2f w=%.2f"
-                          % (err_fl, forward, turn))
-            if not found:
-                self._buscar_linea()
+            self._buscar_linea()
 
         # Circulo opcional (practica 03).
         if ENABLE_CIRCLE:
