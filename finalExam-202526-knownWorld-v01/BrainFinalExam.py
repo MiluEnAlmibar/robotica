@@ -517,9 +517,9 @@ class BrainFinalExam(Brain):
     SEARCH_SLOW_AFTER = 15
     SEARCH_REVERSE_AFTER = 35
 
-    CROSS_COMMIT_STEPS = 22   # pasos que dura la memoria tras dejar de ver la flecha
-    CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
-    STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta"
+    CROSS_COMMIT_STEPS = 22
+    CROSS_RELEASE_PX = 45
+    STRAIGHT_DEADZONE_FRAC = 0.15
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
@@ -745,7 +745,7 @@ class BrainFinalExam(Brain):
             blob = mayor_blob(m_marca_roi)
             arrow_info = orientacion_flecha(blob)
             salida, label = salida_por_flecha(arrow_info, endpoints, roi,
-                                              self.STRAIGHT_DEADZONE_DEG)
+                                              self.STRAIGHT_DEADZONE_FRAC)
             if salida is not None:
                 area = int(blob.sum())
                 if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
