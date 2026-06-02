@@ -461,43 +461,6 @@ class KNNMarcas:
 
 
 # =============================================================================
-# DETECCION DE CIRCULO  (de 03_segmentacion_circulos.ipynb)
-# =============================================================================
-
-def detectar_circulo(gray):
-    """Busca el contorno mas circular y estima la distancia (modelo pinhole).
-    Devuelve (Z_mm, ellipse, circularidad) o (None, None, None)."""
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_cnt, best_circ = None, 0.0
-    for cnt in contours:
-        if len(cnt) < 5:
-            continue
-        area = cv2.contourArea(cnt)
-        if area < MIN_AREA_PX_CIRC:
-            continue
-        per = cv2.arcLength(cnt, True)
-        if per == 0:
-            continue
-        circ = 4 * np.pi * area / (per ** 2)
-        if circ < MIN_CIRCULARIDAD:
-            continue
-        if circ > best_circ:
-            best_circ, best_cnt = circ, cnt
-
-    if best_cnt is None:
-        return None, None, None
-    ellipse = cv2.fitEllipse(best_cnt)
-    diam_px = max(ellipse[1])
-    if diam_px <= 0:
-        return None, None, None
-    Z = (FOCAL_PX * DIAMETRO_REAL_MM) / diam_px
-    return Z, ellipse, best_circ
-
-
-# =============================================================================
 # BRAIN
 # =============================================================================
 
@@ -527,6 +490,12 @@ class BrainFinalExam(Brain):
     # se completa "encima del cruce" en vez de que el AVOID lo aborte demasiado
     # pronto. Subelo si el robot grande llega a rozar la caja al girar.
     OBSTACLE_EMERGENCY = 0.25
+    # Sentido para esquivar la caja cuando esta DE FRENTE:
+    #   'auto'  -> hacia el lado mas despejado del sonar (por defecto)
+    #   'left'  -> siempre por la izquierda (gira a la izda)
+    #   'right' -> siempre por la derecha
+    # Forzar un sentido evita que dude/oscile cuando la caja esta casi centrada.
+    AVOID_PREFER = 'auto'
 
     # Ganancias del control PD de seguimiento (como BrainFollowLine).
     LINE_KP = 0.9
@@ -642,14 +611,18 @@ class BrainFinalExam(Brain):
         girando_cruce = self._cross_steps > 0
         stop = self.OBSTACLE_EMERGENCY if girando_cruce else self.OBSTACLE_STOP
 
-        # Caja de frente: girar FUERTE hacia el lado mas libre, avanzando despacio.
+        # Caja de frente: girar FUERTE hacia el sentido elegido, avanzando despacio.
         if front < stop:
-            if front_left < front_right:
-                self.move(self.SLOW_FORWARD, self.HARD_RIGHT)
-            else:
-                self.move(self.SLOW_FORWARD, self.HARD_LEFT)
-            print("AVOID | front=%.2f gira fuerte%s"
-                  % (front, " (emergencia)" if girando_cruce else ""))
+            if self.AVOID_PREFER == 'left':
+                turn = self.HARD_LEFT
+            elif self.AVOID_PREFER == 'right':
+                turn = self.HARD_RIGHT
+            else:   # 'auto': hacia el lado mas despejado
+                turn = self.HARD_RIGHT if front_left < front_right else self.HARD_LEFT
+            self.move(self.SLOW_FORWARD, turn)
+            print("AVOID | front=%.2f gira %s%s"
+                  % (front, "izda" if turn > 0 else "dcha",
+                     " (emergencia)" if girando_cruce else ""))
             return True
 
         if girando_cruce:
@@ -823,13 +796,7 @@ class BrainFinalExam(Brain):
                           % (err_fl, forward, turn))
             if not found:
                 self._buscar_linea()
-
-        # Circulo opcional (practica 03).
-        if ENABLE_CIRCLE:
-            Z, ellipse, circ = detectar_circulo(gray)
-            if Z is not None:
-                print("CIRCULO | dist=%.2f m circ=%.2f" % (Z / 1000.0, circ))
-
+                
         if DEBUG_VIEW:
             self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
 
