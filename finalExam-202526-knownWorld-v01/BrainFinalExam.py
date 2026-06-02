@@ -22,26 +22,41 @@ import os
 import numpy as np
 import cv2
 
-# findLineDeviation se usa SOLO como red de seguridad si la segmentacion no
-# encuentra la linea. Si no esta disponible, no pasa nada.
-try:
-    from pyrobot.tools.followLineTools import findLineDeviation
-    _HAS_FOLLOWLINE = True
-except Exception:
-    _HAS_FOLLOWLINE = False
-
 
 # =============================================================================
 # CONFIGURACION
 # =============================================================================
 
 # getImage() de pyrobot devuelve BGR (por eso el Brain original hace BGR2GRAY).
-# segmentar() espera RGB (igual que iio.imread en el notebook). Si en tu VM los
-# colores salieran invertidos (la linea se clasifica como marca, etc.), pon False.
+# segmentar() espera RGB (igual que iio.imread en el notebook). Si los colores
+# salieran invertidos (la linea se clasifica como marca, etc.), pon False.
 CAMERA_RETURNS_BGR = True
 
-# Mostrar ventanas de depuracion con opencv.
+# Fuente de imagen:
+#   True  -> camara del robot via pyrobot (self.robot.getImage()). Usar en el
+#            SIMULADOR Stage.
+#   False -> camara USB via OpenCV (cv2.VideoCapture). Usar en el ROBOT FISICO:
+#            la Logitech C920 es un webcam aparte, no la gestiona el driver Aria.
+USE_ROBOT_CAMERA = True
+CAMERA_INDEX = 0       # indice de la camara USB (0 = la primera) si USE_ROBOT_CAMERA=False
+# La C920 captura en 16:9 (640x360 es su resolucion mas baja); 320x240 (4:3) del
+# simulador no es nativo. Estos valores solo aplican a la camara USB.
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 360
+
+# Ancho al que se reescala el frame ANTES de procesarlo. Mantiene la CPU ligera
+# (el PC del robot es modesto) y conserva validos los umbrales en pixeles que se
+# afinaron a ~320 px. El simulador ya viene a 320, asi que no le afecta.
+PROC_WIDTH = 320
+
+# Mostrar ventanas de depuracion con opencv. IMPORTANTE: en el robot fisico,
+# conectado por 'ssh -X', cada imshow reenvia el frame por red y RALENTIZA mucho
+# el bucle de control. Ponlo a False al ejecutar en el robot.
 DEBUG_VIEW = True
+
+# Solo imprimir las lineas de marcas detectadas (MARCA |). Silencia FOLLOW,
+# CRUCE, SEARCH y AVOID. Util cuando solo interesa el resultado de clasificacion.
+PRINT_ONLY_MARCA = False
 
 # Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
 # no hay objeto circular, asi que por defecto esta desactivado. Ponlo a True si
@@ -136,18 +151,24 @@ def runs_in_border(border_pixels):
     return runs
 
 
-def endpoints_en_roi(m_linea, roi):
+def endpoints_en_roi(m_linea, roi, grosor=4):
     """Endpoints donde la linea cruza los 4 bordes de la ROI.
-    Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}."""
+    Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}.
+
+    Cada borde se mira como una BANDA de `grosor` pixeles (no una sola fila):
+    basta con que haya pixel de linea en CUALQUIER fila/columna de la banda para
+    contar el cruce. Asi la segmentacion no necesita llegar al pixel exacto del
+    borde para detectar el endpoint."""
     y0, y1, x0, x1 = roi
     sub = m_linea[y0:y1, x0:x1]
     H, W = sub.shape
+    g = max(1, min(grosor, H // 2, W // 2))
 
     borders = [
-        ('bottom', sub[H - 1, :], lambda m: (x0 + m, y0 + H - 1), 'entrada'),
-        ('top',    sub[0, :],     lambda m: (x0 + m, y0),         'salida'),
-        ('left',   sub[:, 0],     lambda m: (x0, y0 + m),         'salida'),
-        ('right',  sub[:, W - 1], lambda m: (x0 + W - 1, y0 + m), 'salida'),
+        ('bottom', sub[H - g:, :].any(axis=0), lambda m: (x0 + m, y0 + H - 1), 'entrada'),
+        ('top',    sub[:g, :].any(axis=0),      lambda m: (x0 + m, y0),          'salida'),
+        ('left',   sub[:, :g].any(axis=1),      lambda m: (x0, y0 + m),          'salida'),
+        ('right',  sub[:, W - g:].any(axis=1),  lambda m: (x0 + W - 1, y0 + m), 'salida'),
     ]
 
     endpoints = []
@@ -183,15 +204,20 @@ def clasifica_escena(endpoints, umbral_curvatura=10):
     return 'curva izda' if dx_ie < 0 else 'curva dcha'
 
 
+ARROW_MIN_AREA = 400  # px: area minima del blob para considerarlo una flecha real
+
 def mayor_blob(mask_bool):
     """Mascara booleana con SOLO la mayor componente conexa (para aislar la
-    flecha de otras manchas rojas que pueda haber en la ROI)."""
+    flecha de otras manchas rojas que pueda haber en la ROI).
+    Devuelve None si la mayor componente no supera ARROW_MIN_AREA."""
     m = mask_bool.astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     if num <= 1:
-        return mask_bool
+        return None
     # componente 0 = fondo; elegir la de mayor area
     idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[idx, cv2.CC_STAT_AREA] < ARROW_MIN_AREA:
+        return None
     return labels == idx
 
 
@@ -334,9 +360,49 @@ def normalizar_marca(img_bin, size=100):
     return cv2.resize(recorte, (size, size))
 
 
+# Descriptores de Hu PRECALCULADOS de images/marcas/ (28 muestras, mismo pipeline
+# que entrenar()). Embebidos para que el Brain NO necesite el dataset de imagenes
+# en el robot: con esto la clasificacion de marcas funciona sin copiar carpetas.
+# (Generados con el script _calc_marcas.py.)
+MARCAS_CLASES = ['escalera', 'hombre', 'mujer', 'telefono']
+MARCAS_Y = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3]
+MARCAS_X = [
+    [0.550941, 1.459643, 3.603957, 4.866504, 9.164292, 5.778954, 9.198867],
+    [0.492817, 1.214445, 3.709520, 4.943960, -9.544864, -6.284238, -9.219567],
+    [0.580970, 1.621077, 3.634450, 5.042094, 9.474470, 6.126793, 9.352980],
+    [0.550941, 1.459643, 3.603957, 4.866504, 9.164292, 5.778954, 9.198867],
+    [0.141581, 0.319415, 3.276124, 3.501798, 6.890662, 3.662622, -8.358397],
+    [0.673360, 2.416298, 4.092482, 6.720713, -9.997560, 7.936011, -9.997886],
+    [0.287272, 0.649089, 3.358199, 3.719251, 7.258366, 4.052293, -8.380731],
+    [0.628221, 1.592848, 3.138117, 3.665661, 7.067748, 4.470364, 8.303023],
+    [0.752539, 3.504009, 3.392045, 5.153436, 9.337796, 6.936825, 9.685438],
+    [0.724996, 2.283154, 3.309827, 4.611321, 9.205951, -6.756795, -8.564093],
+    [0.705546, 2.064926, 3.265584, 4.189338, 7.954536, 5.298323, -8.287297],
+    [0.729595, 2.312662, 3.322741, 4.570175, 8.751365, 6.215771, 8.577975],
+    [0.726123, 2.229419, 3.347044, 4.505572, 8.593979, 5.993677, 8.541456],
+    [0.746171, 2.813379, 3.378800, 5.012056, 9.679176, -7.095173, -9.148463],
+    [0.732127, 2.342557, 3.695455, 4.831570, 9.480827, -6.589579, 9.060687],
+    [0.704571, 2.070581, 3.605927, 4.617448, 9.199464, -6.653388, 8.723904],
+    [0.673911, 1.800562, 3.561516, 4.092926, 7.917183, 5.008698, -9.123862],
+    [0.641538, 1.650376, 3.403459, 3.817050, 7.427058, 4.643843, 8.597724],
+    [0.593272, 1.448200, 3.294520, 3.643264, 7.113257, 4.378901, -8.164255],
+    [0.593046, 1.448204, 3.186147, 3.509136, 6.856565, 4.233335, -8.512201],
+    [0.669403, 1.803580, 3.463410, 4.272232, 8.257051, 5.720992, -8.310620],
+    [0.474173, 1.264654, 2.115258, 2.663164, 5.248106, 3.800556, 5.165474],
+    [0.469153, 1.255406, 2.117151, 2.793181, 5.828677, -4.383963, 5.263880],
+    [0.471759, 1.279931, 2.130844, 2.958494, -5.722780, -3.708109, 5.601307],
+    [0.567130, 1.772506, 2.341749, 2.771513, 5.498858, 3.873265, 5.460156],
+    [0.521650, 1.435924, 2.325260, 3.162607, -6.020409, -3.976777, -6.101045],
+    [0.504306, 1.369476, 2.262827, 3.120213, -5.846016, -3.840268, -6.229235],
+    [0.550750, 1.598026, 2.373751, 3.200847, -6.052271, -4.063473, -6.284057],
+]
+
+
 class KNNMarcas:
     """KNN (k=3) en numpy puro sobre descriptores de Hu. Se entrena cargando
-    images/marcas/<clase>/*.png al arrancar el Brain."""
+    images/marcas/<clase>/*.png, o desde los descriptores embebidos (MARCAS_X)
+    para no depender del dataset de imagenes en el robot."""
 
     def __init__(self, k=3):
         self.k = k
@@ -380,6 +446,17 @@ class KNNMarcas:
         self.ok = True
         return True
 
+    def cargar_embebido(self):
+        """Carga los descriptores precalculados embebidos en el modulo. No
+        necesita ningun fichero externo."""
+        if not MARCAS_X:
+            return False
+        self.clases = list(MARCAS_CLASES)
+        self.X = np.array(MARCAS_X, dtype=np.float64)
+        self.y = np.array(MARCAS_Y, dtype=int)
+        self.ok = True
+        return True
+
     def predict(self, descriptor):
         """Devuelve el nombre de clase del voto mayoritario de los k vecinos."""
         if not self.ok:
@@ -388,44 +465,6 @@ class KNNMarcas:
         vecinos = self.y[np.argsort(d)[:self.k]]
         clase = np.bincount(vecinos).argmax()
         return self.clases[clase]
-
-
-# =============================================================================
-# DETECCION DE CIRCULO  (de 03_segmentacion_circulos.ipynb)
-# =============================================================================
-
-def detectar_circulo(gray):
-    """Busca el contorno mas circular y estima la distancia (modelo pinhole).
-    Devuelve (Z_mm, ellipse, circularidad) o (None, None, None)."""
-    blur = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    best_cnt, best_circ = None, 0.0
-    for cnt in contours:
-        if len(cnt) < 5:
-            continue
-        area = cv2.contourArea(cnt)
-        if area < MIN_AREA_PX_CIRC:
-            continue
-        per = cv2.arcLength(cnt, True)
-        if per == 0:
-            continue
-        circ = 4 * np.pi * area / (per ** 2)
-        if circ < MIN_CIRCULARIDAD:
-            continue
-        if circ > best_circ:
-            best_circ, best_cnt = circ, cnt
-
-    if best_cnt is None:
-        return None, None, None
-    ellipse = cv2.fitEllipse(best_cnt)
-    diam_px = max(ellipse[1])
-    if diam_px <= 0:
-        return None, None, None
-    Z = (FOCAL_PX * DIAMETRO_REAL_MM) / diam_px
-    return Z, ellipse, best_circ
-
 
 # =============================================================================
 # BRAIN
@@ -445,11 +484,6 @@ class BrainFinalExam(Brain):
     MED_RIGHT = -0.5
     HARD_RIGHT = -1.0
 
-    # Evasion de obstaculos con sonar, como el BrainFollowLine original (reactivo:
-    # avanzar y girar hacia el lado mas libre), pero girando MAS FUERTE (HARD en
-    # vez de MED) para que llegue a esquivar la caja aunque aparezca justo
-    # despues de un giro. Solo la caja devuelve laser (la linea/marcas no), asi
-    # que el sonar solo "ve" el obstaculo.
     OBSTACLE_STOP = 0.40   # caja de frente -> girar fuerte avanzando despacio
     OBSTACLE_WARN = 0.65   # caja al costado -> girar fuerte avanzando medio
 
@@ -458,25 +492,41 @@ class BrainFinalExam(Brain):
     LINE_KD = 0.5
 
     # Velocidades del controlador visual.
-    V_MAX = 0.5
+    V_MAX = 0.7
     V_MIN = 0.05
 
     # Busqueda de linea perdida.
     SEARCH_SLOW_AFTER = 15
     SEARCH_REVERSE_AFTER = 35
 
-    # Memoria de cruce: una vez la flecha elige una salida, el robot se
-    # "compromete" con ella y la sigue aunque la flecha ya no se vea, hasta que
-    # vuelve a haber una sola linea centrada. Asi no escoge la rama al azar.
-    CROSS_COMMIT_STEPS = 22   # pasos que dura la memoria tras dejar de ver la flecha
-    CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
-    STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta"
+    CROSS_COMMIT_STEPS = 30   # pasos maximos de giro (liberacion anticipada si linea aparece en el lado correcto)
+    CROSS_RELEASE_PX = 60      # umbral (px): libera 'straight'; para lateral, se usa CROSS_RELEASE_PX//2
+    STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta" (igual que el sim)
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
         self._lost_line_steps = 0
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
+
+        # Fuente de imagen: camara del robot (simulador) o camara USB (robot
+        # fisico). Se usa la USB si se pide explicitamente (USE_ROBOT_CAMERA=False)
+        # o si el robot no expone getImage() (p.ej. el AriaRobot del Pioneer, cuya
+        # camara C920 es un webcam USB aparte): asi funciona en ambos sin tocar el
+        # flag.
+        self.capture = None
+        use_usb = (not USE_ROBOT_CAMERA) or (not hasattr(self.robot, 'getImage'))
+        if use_usb:
+            self.capture = cv2.VideoCapture(CAMERA_INDEX)
+            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            if self.capture.isOpened():
+                print("[FinalExam] Camara USB abierta (index %d)." % CAMERA_INDEX)
+            else:
+                print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX,
+                      "- prueba otro CAMERA_INDEX (1, 2, ...).")
+        else:
+            print("[FinalExam] Usando la camara del robot (getImage).")
 
         # Memoria del cruce en curso.
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
@@ -485,20 +535,41 @@ class BrainFinalExam(Brain):
         self._cross_best_area = 0      # mayor area de flecha vista en este cruce
         self._cross_label = 'none'     # 'left'/'straight'/'right' decidido
 
-        # Entrenar el clasificador de marcas desde la primera carpeta valida.
+        # Clasificador de marcas: si hay carpeta images/marcas/ se entrena de ella
+        # (util para re-entrenar con fotos reales); si no, usa los descriptores
+        # EMBEBIDOS, asi no hace falta copiar el dataset al robot.
         self.knn = KNNMarcas(k=3)
+        entrenado = False
         for cand in MARCAS_DIR_CANDIDATAS:
             if self.knn.entrenar(cand):
                 print("[FinalExam] Marcas entrenadas desde:", os.path.abspath(cand),
                       "->", self.knn.clases)
+                entrenado = True
                 break
-        if not self.knn.ok:
-            print("[FinalExam] AVISO: no se encontro images/marcas/. "
-                  "Clasificacion de marcas desactivada. "
-                  "Copia la carpeta junto al Brain o define MARCAS_DIR.")
+        if not entrenado:
+            self.knn.cargar_embebido()
+            print("[FinalExam] Marcas: usando descriptores embebidos (%d muestras, %s)."
+                  % (len(self.knn.y), self.knn.clases))
 
     def destroy(self):
+        if getattr(self, 'capture', None) is not None:
+            self.capture.release()
         cv2.destroyAllWindows()
+
+    def _get_image(self):
+        """Captura un frame BGR de la fuente configurada (camara USB del robot
+        fisico o camara del robot via pyrobot en el simulador) y lo reescala a
+        PROC_WIDTH para aligerar el procesamiento."""
+        if self.capture is not None:
+            ok, frame = self.capture.read()
+            if not ok:
+                return None
+        else:
+            frame = self.robot.getImage()
+        if frame is not None and PROC_WIDTH and frame.shape[1] > PROC_WIDTH:
+            h = int(frame.shape[0] * PROC_WIDTH / float(frame.shape[1]))
+            frame = cv2.resize(frame, (PROC_WIDTH, h))
+        return frame
 
     # --- sonar -----------------------------------------------------------
     def _min_range(self, group_name, default=3.0):
@@ -512,10 +583,6 @@ class BrainFinalExam(Brain):
         return min(distances) if distances else default
 
     def _avoid_obstacle(self):
-        """Evasion reactiva como el BrainFollowLine original: avanzar y girar
-        hacia el lado mas libre, pero con giro HARD (en vez de MED) para que
-        llegue a esquivar la caja aunque aparezca justo despues de un giro.
-        Devuelve True si ha tomado el control."""
         front = self._min_range("front")
         front_left = self._min_range("front-left")
         front_right = self._min_range("front-right")
@@ -526,17 +593,20 @@ class BrainFinalExam(Brain):
                 self.move(self.SLOW_FORWARD, self.HARD_RIGHT)
             else:
                 self.move(self.SLOW_FORWARD, self.HARD_LEFT)
-            print("AVOID | front=%.2f gira fuerte" % front)
+            if not PRINT_ONLY_MARCA:
+                print("AVOID | front=%.2f gira fuerte" % front)
             return True
 
         # Caja al costado: seguir avanzando pero girando fuerte para apartarse.
         if front_left < self.OBSTACLE_WARN:
             self.move(self.MED_FORWARD, self.HARD_RIGHT)
-            print("AVOID | front_left=%.2f aparta dcha" % front_left)
+            if not PRINT_ONLY_MARCA:
+                print("AVOID | front_left=%.2f aparta dcha" % front_left)
             return True
         if front_right < self.OBSTACLE_WARN:
             self.move(self.MED_FORWARD, self.HARD_LEFT)
-            print("AVOID | front_right=%.2f aparta izda" % front_right)
+            if not PRINT_ONLY_MARCA:
+                print("AVOID | front_right=%.2f aparta izda" % front_right)
             return True
         return False
 
@@ -569,8 +639,9 @@ class BrainFinalExam(Brain):
             self._search_dir *= -1
             self._lost_line_steps = 0
             self.move(self.VERY_SLOW_FORWARD, self._search_dir)
-        print("SEARCH | step=%d last_error=%.3f dir=%.2f"
-              % (self._lost_line_steps, self.last_error, self._search_dir))
+        if not PRINT_ONLY_MARCA:
+            print("SEARCH | step=%d last_error=%.3f dir=%.2f"
+                  % (self._lost_line_steps, self.last_error, self._search_dir))
 
     # --- clasificacion de marca -----------------------------------------
     def _clasificar_marca(self, m_marca_roi):
@@ -588,12 +659,12 @@ class BrainFinalExam(Brain):
 
     # --- bucle principal -------------------------------------------------
     def step(self):
-        cv_image = self.robot.getImage()
+        cv_image = self._get_image()
+        if cv_image is None:                 # sin frame (camara no lista): parar y reintentar
+            self.move(self.NO_FORWARD, self.NO_TURN)
+            return
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB) if CAMERA_RETURNS_BGR else cv_image
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
-        # PERCEPCION: segmentar y analizar la escena (antes que la evasion, para
-        # que el rodeo sepa cuando la linea vuelve a estar centrada).
         roi = get_roi(rgb.shape)
         etiquetas = segmentar(rgb)
         m_linea, m_marca = mascaras(etiquetas)
@@ -605,9 +676,6 @@ class BrainFinalExam(Brain):
         W = rgb.shape[1]
         arrow_info, salida = None, None
 
-        # PRIORIDAD 1: esquivar el obstaculo. Al esquivar se abandona cualquier
-        # compromiso de cruce (el robot reorienta y ese compromiso ya no tiene
-        # sentido: provocaba que tras esquivar girase al lado contrario).
         if self._avoid_obstacle():
             self._cross_steps = 0
             self._cross_label = 'none'
@@ -615,18 +683,13 @@ class BrainFinalExam(Brain):
                 self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
             return
 
-        # Si vemos una flecha en un cruce, decidimos la direccion (left/straight/
-        # right). La decision se FIJA con la mejor vista de la flecha (la de mayor
-        # area), no con cualquier frame parcial, para no salir por una lateral en
-        # un cruce recto solo porque la flecha se vea a medias. Mientras la flecha
-        # sea visible se refresca la memoria; al perderla, el robot sigue
-        # comprometido CROSS_COMMIT_STEPS pasos mas, asi NO escoge la rama al azar.
         if 'cruce' in escena and m_marca_roi.any():
             blob = mayor_blob(m_marca_roi)
-            arrow_info = orientacion_flecha(blob)
+            if blob is not None:
+                arrow_info = orientacion_flecha(blob)
             salida, label = salida_por_flecha(arrow_info, endpoints, roi,
                                               self.STRAIGHT_DEADZONE_DEG)
-            if salida is not None:
+            if salida is not None and blob is not None:
                 area = int(blob.sum())
                 if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
                     self._cross_best_area = 0
@@ -639,10 +702,6 @@ class BrainFinalExam(Brain):
         # PRIORIDAD 2: resolver el cruce usando la direccion MEMORIZADA.
         if self._cross_steps > 0:
             self._cross_steps -= 1
-            # Reproyecta la direccion fijada sobre los endpoints actuales, pero
-            # SOLO si es coherente con el sentido comprometido. Asi 'left' siempre
-            # gira a la izda (err<0) aunque una reproyeccion espuria diera err>0
-            # (lo que antes hacia que se fuera al lado contrario).
             sal_mem = salida_de_label(endpoints, self._cross_label, x_centro)
             if sal_mem is not None:
                 new_err = sal_mem['pt'][0] - x_centro
@@ -652,16 +711,31 @@ class BrainFinalExam(Brain):
                 if coherente:
                     self._cross_err = new_err
                     self._cross_side = sal_mem['side']
-            forward, turn = self._control_pd(self._cross_err, W)
+
+            # Para giros laterales (90°) forzamos giro DURO con velocidad reducida.
+            # El PD solo se usa en 'straight' donde la salida esta casi centrada.
+            if self._cross_label == 'left':
+                forward, turn = self.SLOW_FORWARD, self.HARD_LEFT
+            elif self._cross_label == 'right':
+                forward, turn = self.SLOW_FORWARD, self.HARD_RIGHT
+            else:
+                forward, turn = self._control_pd(self._cross_err, W)
+
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
-                  % (self._cross_label, self._cross_side, self._cross_steps,
-                     self._cross_err, forward, turn))
+            if not PRINT_ONLY_MARCA:
+                print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
+                      % (self._cross_label, self._cross_side, self._cross_steps,
+                         self._cross_err, forward, turn))
 
-            # Libera la memoria cuando ya hay una sola linea (re)centrada: el
-            # robot ya esta encarrilado en la rama correcta.
-            if (escena in ('linea recta', 'curva izda', 'curva dcha')
+            # Liberacion del cruce:
+            # - 'straight': se libera cuando la linea esta centrada.
+            # - 'left'/'right': NO se libera por error de linea; cualquier linea
+            #   visible durante el giro puede cumplir el umbral prematuramente.
+            #   Se libera SOLO cuando _cross_steps llega a 0 (tiempo suficiente
+            #   para completar el giro de 90°).
+            if (self._cross_label == 'straight'
+                    and escena in ('linea recta', 'curva izda', 'curva dcha')
                     and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
                 self._cross_steps = 0
                 self._cross_side = None
@@ -672,7 +746,8 @@ class BrainFinalExam(Brain):
             forward, turn = self._control_pd(err_px, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("FOLLOW | %s err=%.1f v=%.2f w=%.2f" % (escena, err_px, forward, turn))
+            if not PRINT_ONLY_MARCA:
+                print("FOLLOW | %s err=%.1f v=%.2f w=%.2f" % (escena, err_px, forward, turn))
 
             # En recta/curva, una mancha roja lateral es una marca: clasificarla.
             if 'cruce' not in escena:
@@ -681,25 +756,9 @@ class BrainFinalExam(Brain):
                     print("MARCA  | detectada: %s" % marca)
                     self._last_mark = marca
 
-        # PRIORIDAD 4: red de seguridad con findLineDeviation, luego buscar.
+        # PRIORIDAD 4: buscar linea
         else:
-            found = False
-            if _HAS_FOLLOWLINE:
-                found, err_fl = findLineDeviation(gray)
-                if found:
-                    forward, turn = self._control_pd(err_fl * (W / 2.0), W)
-                    self._lost_line_steps = 0
-                    self.move(forward, turn)
-                    print("FOLLOW(fallback) | err=%.3f v=%.2f w=%.2f"
-                          % (err_fl, forward, turn))
-            if not found:
-                self._buscar_linea()
-
-        # Circulo opcional (practica 03).
-        if ENABLE_CIRCLE:
-            Z, ellipse, circ = detectar_circulo(gray)
-            if Z is not None:
-                print("CIRCULO | dist=%.2f m circ=%.2f" % (Z / 1000.0, circ))
+            self._buscar_linea()
 
         if DEBUG_VIEW:
             self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
