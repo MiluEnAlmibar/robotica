@@ -54,6 +54,10 @@ PROC_WIDTH = 320
 # el bucle de control. Ponlo a False al ejecutar en el robot.
 DEBUG_VIEW = True
 
+# Solo imprimir las lineas de marcas detectadas (MARCA |). Silencia FOLLOW,
+# CRUCE, SEARCH y AVOID. Util cuando solo interesa el resultado de clasificacion.
+PRINT_ONLY_MARCA = False
+
 # Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
 # no hay objeto circular, asi que por defecto esta desactivado. Ponlo a True si
 # usas un mundo con un circulo/pelota.
@@ -584,17 +588,20 @@ class BrainFinalExam(Brain):
                 self.move(self.SLOW_FORWARD, self.HARD_RIGHT)
             else:
                 self.move(self.SLOW_FORWARD, self.HARD_LEFT)
-            print("AVOID | front=%.2f gira fuerte" % front)
+            if not PRINT_ONLY_MARCA:
+                print("AVOID | front=%.2f gira fuerte" % front)
             return True
 
         # Caja al costado: seguir avanzando pero girando fuerte para apartarse.
         if front_left < self.OBSTACLE_WARN:
             self.move(self.MED_FORWARD, self.HARD_RIGHT)
-            print("AVOID | front_left=%.2f aparta dcha" % front_left)
+            if not PRINT_ONLY_MARCA:
+                print("AVOID | front_left=%.2f aparta dcha" % front_left)
             return True
         if front_right < self.OBSTACLE_WARN:
             self.move(self.MED_FORWARD, self.HARD_LEFT)
-            print("AVOID | front_right=%.2f aparta izda" % front_right)
+            if not PRINT_ONLY_MARCA:
+                print("AVOID | front_right=%.2f aparta izda" % front_right)
             return True
         return False
 
@@ -627,8 +634,9 @@ class BrainFinalExam(Brain):
             self._search_dir *= -1
             self._lost_line_steps = 0
             self.move(self.VERY_SLOW_FORWARD, self._search_dir)
-        print("SEARCH | step=%d last_error=%.3f dir=%.2f"
-              % (self._lost_line_steps, self.last_error, self._search_dir))
+        if not PRINT_ONLY_MARCA:
+            print("SEARCH | step=%d last_error=%.3f dir=%.2f"
+                  % (self._lost_line_steps, self.last_error, self._search_dir))
 
     # --- clasificacion de marca -----------------------------------------
     def _clasificar_marca(self, m_marca_roi):
@@ -700,9 +708,10 @@ class BrainFinalExam(Brain):
             forward, turn = self._control_pd(self._cross_err, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
-                  % (self._cross_label, self._cross_side, self._cross_steps,
-                     self._cross_err, forward, turn))
+            if not PRINT_ONLY_MARCA:
+                print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
+                      % (self._cross_label, self._cross_side, self._cross_steps,
+                         self._cross_err, forward, turn))
             if (escena in ('linea recta', 'curva izda', 'curva dcha')
                     and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
                 self._cross_steps = 0
@@ -714,7 +723,8 @@ class BrainFinalExam(Brain):
             forward, turn = self._control_pd(err_px, W)
             self._lost_line_steps = 0
             self.move(forward, turn)
-            print("FOLLOW | %s err=%.1f v=%.2f w=%.2f" % (escena, err_px, forward, turn))
+            if not PRINT_ONLY_MARCA:
+                print("FOLLOW | %s err=%.1f v=%.2f w=%.2f" % (escena, err_px, forward, turn))
 
             # En recta/curva, una mancha roja lateral es una marca: clasificarla.
             if 'cruce' not in escena:
