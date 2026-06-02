@@ -60,7 +60,7 @@ PROC_WIDTH = 320
 # Mostrar ventanas de depuracion con opencv. IMPORTANTE: en el robot fisico,
 # conectado por 'ssh -X', cada imshow reenvia el frame por red y RALENTIZA mucho
 # el bucle de control. Ponlo a False al ejecutar en el robot.
-DEBUG_VIEW = True
+DEBUG_VIEW = False
 
 # Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
 # no hay objeto circular, asi que por defecto esta desactivado. Ponlo a True si
@@ -541,6 +541,9 @@ class BrainFinalExam(Brain):
         else:
             print("[FinalExam] Usando la camara del robot (getImage).")
 
+        # Sentido de esquiva fijado (latch): 0 = sin esquiva en curso.
+        self._avoid_turn = 0
+
         # Memoria del cruce en curso.
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
         self._cross_side = None        # lado de la salida elegida ('top'/'left'/'right')
@@ -603,6 +606,8 @@ class BrainFinalExam(Brain):
         front = self._min_range("front")
         front_left = self._min_range("front-left")
         front_right = self._min_range("front-right")
+        left = self._min_range("left")
+        right = self._min_range("right")
 
         # Si estamos girando en un cruce, relajar la evasion a solo EMERGENCIA:
         # umbral frontal mas corto y sin avisos laterales. Asi el giro se completa
@@ -611,20 +616,31 @@ class BrainFinalExam(Brain):
         girando_cruce = self._cross_steps > 0
         stop = self.OBSTACLE_EMERGENCY if girando_cruce else self.OBSTACLE_STOP
 
-        # Caja de frente: girar FUERTE hacia el sentido elegido, avanzando despacio.
+        # Caja de frente: ir hacia donde el sonar ve MAS espacio libre (el lado
+        # cuyo obstaculo mas cercano esta mas lejos, combinando el sensor frontal
+        # y el lateral de cada lado). El sentido se decide UNA vez al empezar la
+        # esquiva y se MANTIENE (latch) hasta que el frente se despeja, para no
+        # dudar/oscilar cuando la caja esta casi centrada.
         if front < stop:
-            if self.AVOID_PREFER == 'left':
-                turn = self.HARD_LEFT
-            elif self.AVOID_PREFER == 'right':
-                turn = self.HARD_RIGHT
-            else:   # 'auto': hacia el lado mas despejado
-                turn = self.HARD_RIGHT if front_left < front_right else self.HARD_LEFT
-            self.move(self.SLOW_FORWARD, turn)
-            print("AVOID | front=%.2f gira %s%s"
-                  % (front, "izda" if turn > 0 else "dcha",
-                     " (emergencia)" if girando_cruce else ""))
+            if self._avoid_turn == 0:
+                if self.AVOID_PREFER == 'left':
+                    self._avoid_turn = self.HARD_LEFT
+                elif self.AVOID_PREFER == 'right':
+                    self._avoid_turn = self.HARD_RIGHT
+                else:
+                    libre_izda = min(front_left, left)
+                    libre_dcha = min(front_right, right)
+                    self._avoid_turn = (self.HARD_LEFT if libre_izda >= libre_dcha
+                                        else self.HARD_RIGHT)
+            self.move(self.SLOW_FORWARD, self._avoid_turn)
+            print("AVOID | front=%.2f -> %s%s (libre izda=%.2f dcha=%.2f)"
+                  % (front, "izda" if self._avoid_turn > 0 else "dcha",
+                     " (emergencia)" if girando_cruce else "",
+                     min(front_left, left), min(front_right, right)))
             return True
 
+        # Frente despejado: termina la esquiva (suelta el latch).
+        self._avoid_turn = 0
         if girando_cruce:
             return False   # durante el giro ignoramos los avisos laterales
 
