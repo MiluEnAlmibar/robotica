@@ -22,14 +22,6 @@ import os
 import numpy as np
 import cv2
 
-# findLineDeviation se usa SOLO como red de seguridad si la segmentacion no
-# encuentra la linea. Si no esta disponible, no pasa nada.
-try:
-    from pyrobot.tools.followLineTools import findLineDeviation
-    _HAS_FOLLOWLINE = True
-except Exception:
-    _HAS_FOLLOWLINE = False
-
 
 # =============================================================================
 # CONFIGURACION
@@ -61,6 +53,13 @@ PROC_WIDTH = 320
 # conectado por 'ssh -X', cada imshow reenvia el frame por red y RALENTIZA mucho
 # el bucle de control. Ponlo a False al ejecutar en el robot.
 DEBUG_VIEW = False
+
+# Guardar a disco frames anotados (linea/marca/ROI/endpoints) cuando hay una
+# flecha visible, para diagnosticar por que no se detecta el cruce en el robot.
+# Genera dbg_000.png, dbg_001.png ... (hasta SAVE_DEBUG_MAX). Ponlo a False en
+# uso normal. Util porque por 'ssh -X' no se pueden ver ventanas con fluidez.
+SAVE_DEBUG_FRAMES = False
+SAVE_DEBUG_MAX = 40
 
 # Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
 # no hay objeto circular, asi que por defecto esta desactivado. Ponlo a True si
@@ -275,32 +274,49 @@ def salida_de_label(endpoints, label, xc):
     return min(cand, key=lambda e: abs(e['pt'][0] - xc))
 
 
-def salida_por_flecha(arrow_info, endpoints, roi, deadzone_deg=35.0):
-    """Decide la salida en un cruce a partir de la inclinacion de la flecha.
-
-    En vez de la similitud de coseno (fragil cuando la flecha se ve parcial),
-    clasificamos la flecha en 'left' / 'straight' / 'right' segun cuanto se
-    inclina respecto a la vertical de la imagen, con una zona muerta amplia a
-    favor de 'recto'. Asi una flecha casi vertical (recta), aunque se vea a
-    medias, no se confunde con una salida lateral.
-
-    Devuelve (salida_dict, label) o (None, 'none')."""
+def salida_elegida(arrow_info, endpoints, roi):
+    """(Criterio del notebook 02) Salida cuya direccion desde el centroide de la
+    flecha forma el menor angulo con el vector centroide->punta (maxima cosine).
+    Devuelve el dict de salida o None."""
     if arrow_info is None:
-        return None, 'none'
+        return None
+    y0, _, x0, _ = roi
     cx, cy, tx, ty = arrow_info
     vx, vy = tx - cx, ty - cy
-    # Inclinacion respecto a la vertical (0 = vertical/recto, 90 = horizontal).
-    # Usamos valores absolutos para ignorar el signo (la punta puede salir hacia
-    # arriba o hacia abajo segun el recorte del blob).
-    lean = np.degrees(np.arctan2(abs(vx), abs(vy) + 1e-9))
-    if lean < deadzone_deg:
-        label = 'straight'
-    elif vx < 0:
-        label = 'left'
-    else:
-        label = 'right'
+    n = np.hypot(vx, vy)
+    if n < 1e-6:
+        return None
+    vx, vy = vx / n, vy / n
+    cgx, cgy = cx + x0, cy + y0
+    salidas = [e for e in endpoints if e['role'] == 'salida']
+    if not salidas:
+        return None
+
+    def cos_ang(s):
+        dx, dy = s['pt'][0] - cgx, s['pt'][1] - cgy
+        d = np.hypot(dx, dy)
+        return (dx * vx + dy * vy) / d if d > 1e-6 else -2.0
+
+    return max(salidas, key=cos_ang)
+
+
+def salida_por_flecha(arrow_info, endpoints, roi, deadzone_px_frac=0.10):
+    """Elige la salida con el criterio del notebook (maxima alineacion con la
+    flecha) y deriva una etiqueta 'left'/'straight'/'right' SOLO para la memoria
+    del cruce (reproyeccion + coherencia de signo cuando la flecha ya no se ve).
+
+    Devuelve (salida_dict, label) o (None, 'none')."""
+    sal = salida_elegida(arrow_info, endpoints, roi)
+    if sal is None:
+        return None, 'none'
     xc = (roi[2] + roi[3]) / 2.0
-    return salida_de_label(endpoints, label, xc), label
+    margen = (roi[3] - roi[2]) * deadzone_px_frac   # zona muerta de 'recto' en px
+    dx = sal['pt'][0] - xc
+    if sal['side'] == 'top' or abs(dx) <= margen:
+        label = 'straight'
+    else:
+        label = 'left' if dx < 0 else 'right'
+    return sal, label
 
 
 def error_seguimiento(m_linea, roi, alto_franja=15):
@@ -478,40 +494,22 @@ class BrainFinalExam(Brain):
     MED_RIGHT = -0.5
     HARD_RIGHT = -1.0
 
-    # Evasion de obstaculos con sonar, como el BrainFollowLine original (reactivo:
-    # avanzar y girar hacia el lado mas libre), pero girando MAS FUERTE (HARD en
-    # vez de MED) para que llegue a esquivar la caja aunque aparezca justo
-    # despues de un giro. Solo la caja devuelve laser (la linea/marcas no), asi
-    # que el sonar solo "ve" el obstaculo.
-    OBSTACLE_STOP = 0.40   # caja de frente -> girar fuerte avanzando despacio
-    OBSTACLE_WARN = 0.65   # caja al costado -> girar fuerte avanzando medio
-    # Mientras se gira en un cruce, solo se esquiva si la caja esta MAS cerca que
-    # esto (emergencia). Asi el giro de la flecha (que aleja al robot de la caja)
-    # se completa "encima del cruce" en vez de que el AVOID lo aborte demasiado
-    # pronto. Subelo si el robot grande llega a rozar la caja al girar.
+    OBSTACLE_STOP = 0.40
+    OBSTACLE_WARN = 0.65
     OBSTACLE_EMERGENCY = 0.25
-    # Sentido para esquivar la caja cuando esta DE FRENTE:
-    #   'auto'  -> hacia el lado mas despejado del sonar (por defecto)
-    #   'left'  -> siempre por la izquierda (gira a la izda)
-    #   'right' -> siempre por la derecha
-    # Forzar un sentido evita que dude/oscile cuando la caja esta casi centrada.
-    AVOID_PREFER = 'auto'
 
-    # Ganancias del control PD de seguimiento (como BrainFollowLine).
+    AVOID_PREFER = 'left'
+
     LINE_KP = 0.9
     LINE_KD = 0.5
 
-    # Velocidades del controlador visual.
-    V_MAX = 0.5
+    V_MAX = 0.7
     V_MIN = 0.05
 
     # Busqueda de linea perdida.
     SEARCH_SLOW_AFTER = 15
     SEARCH_REVERSE_AFTER = 35
 
-    # Memoria de cruce: una vez la flecha elige una salida, el robot se
-    # "compromete" con ella y la sigue aunque la flecha ya no se vea, hasta que
-    # vuelve a haber una sola linea centrada. Asi no escoge la rama al azar.
     CROSS_COMMIT_STEPS = 22   # pasos que dura la memoria tras dejar de ver la flecha
     CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
     STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta"
@@ -521,25 +519,16 @@ class BrainFinalExam(Brain):
         self._lost_line_steps = 0
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
+        self._dbg_n = 0                # contador de frames de diagnostico guardados
 
-        # Fuente de imagen: camara del robot (simulador) o camara USB (robot
-        # fisico). Se usa la USB si se pide explicitamente (USE_ROBOT_CAMERA=False)
-        # o si el robot no expone getImage() (p.ej. el AriaRobot del Pioneer, cuya
-        # camara C920 es un webcam USB aparte): asi funciona en ambos sin tocar el
-        # flag.
-        self.capture = None
-        use_usb = (not USE_ROBOT_CAMERA) or (not hasattr(self.robot, 'getImage'))
-        if use_usb:
-            self.capture = cv2.VideoCapture(CAMERA_INDEX)
-            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            if self.capture.isOpened():
-                print("[FinalExam] Camara USB abierta (index %d)." % CAMERA_INDEX)
-            else:
-                print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX,
-                      "- prueba otro CAMERA_INDEX (1, 2, ...).")
+        self.capture = cv2.VideoCapture(CAMERA_INDEX)
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        if self.capture.isOpened():
+            print("[FinalExam] Camara del Pioneer (C920 USB) abierta (index %d)." % CAMERA_INDEX)
         else:
-            print("[FinalExam] Usando la camara del robot (getImage).")
+            print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX,
+                  "- prueba otro CAMERA_INDEX (1, 2, ...).")
 
         # Sentido de esquiva fijado (latch): 0 = sin esquiva en curso.
         self._avoid_turn = 0
@@ -599,28 +588,15 @@ class BrainFinalExam(Brain):
         return min(distances) if distances else default
 
     def _avoid_obstacle(self):
-        """Evasion reactiva como el BrainFollowLine original: avanzar y girar
-        hacia el lado mas libre, pero con giro HARD (en vez de MED) para que
-        llegue a esquivar la caja aunque aparezca justo despues de un giro.
-        Devuelve True si ha tomado el control."""
         front = self._min_range("front")
         front_left = self._min_range("front-left")
         front_right = self._min_range("front-right")
         left = self._min_range("left")
         right = self._min_range("right")
 
-        # Si estamos girando en un cruce, relajar la evasion a solo EMERGENCIA:
-        # umbral frontal mas corto y sin avisos laterales. Asi el giro se completa
-        # encima del cruce (alejando al robot de la caja) en lugar de que el AVOID
-        # lo aborte demasiado pronto (el robot real es grande y ve la caja antes).
         girando_cruce = self._cross_steps > 0
         stop = self.OBSTACLE_EMERGENCY if girando_cruce else self.OBSTACLE_STOP
 
-        # Caja de frente: ir hacia donde el sonar ve MAS espacio libre (el lado
-        # cuyo obstaculo mas cercano esta mas lejos, combinando el sensor frontal
-        # y el lateral de cada lado). El sentido se decide UNA vez al empezar la
-        # esquiva y se MANTIENE (latch) hasta que el frente se despeja, para no
-        # dudar/oscilar cuando la caja esta casi centrada.
         if front < stop:
             if self._avoid_turn == 0:
                 if self.AVOID_PREFER == 'left':
@@ -701,14 +677,37 @@ class BrainFinalExam(Brain):
         norm = cv2.medianBlur(norm, 5)
         return self.knn.predict(hu_descriptor(norm))
 
+    # --- diagnostico a disco --------------------------------------------
+    def _guardar_dbg(self, cv_image, roi, m_linea, m_marca, endpoints, escena):
+        """Guarda un frame anotado (linea/marca/ROI/endpoints) para ver por que
+        no se detecta el cruce. Solo si SAVE_DEBUG_FRAMES y hasta SAVE_DEBUG_MAX."""
+        if self._dbg_n >= SAVE_DEBUG_MAX:
+            return
+        vis = cv_image.copy()
+        vis[m_linea] = (0, 255, 0)        # linea segmentada en verde
+        vis[m_marca] = (0, 0, 255)        # marca/flecha en rojo
+        y0, y1, x0, x1 = roi
+        cv2.rectangle(vis, (x0, y0), (x1 - 1, y1 - 1), (255, 0, 0), 1)
+        for e in endpoints:
+            col = (0, 255, 255) if e['role'] == 'entrada' else (255, 0, 255)
+            cv2.circle(vis, e['pt'], 5, col, -1)
+            cv2.putText(vis, e['side'][:1], (e['pt'][0] + 4, e['pt'][1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
+        cv2.putText(vis, "%s  n_ep=%d" % (escena, len(endpoints)), (3, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        fn = "dbg_%03d.png" % self._dbg_n
+        cv2.imwrite(fn, vis)
+        print("DBG    | %s  escena=%s  n_ep=%d  bordes=%s"
+              % (fn, escena, len(endpoints), [e['side'] for e in endpoints]))
+        self._dbg_n += 1
+
     # --- bucle principal -------------------------------------------------
     def step(self):
         cv_image = self._get_image()
-        if cv_image is None:                 # sin frame (camara no lista): parar y reintentar
+        if cv_image is None:
             self.move(self.NO_FORWARD, self.NO_TURN)
             return
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB) if CAMERA_RETURNS_BGR else cv_image
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
         # PERCEPCION: segmentar y analizar la escena (antes que la evasion, para
         # que el rodeo sepa cuando la linea vuelve a estar centrada).
@@ -723,22 +722,18 @@ class BrainFinalExam(Brain):
         W = rgb.shape[1]
         arrow_info, salida = None, None
 
-        # PRIORIDAD 1: esquivar el obstaculo. Al esquivar se abandona cualquier
-        # compromiso de cruce (el robot reorienta y ese compromiso ya no tiene
-        # sentido: provocaba que tras esquivar girase al lado contrario).
+        # Diagnostico: guardar el frame anotado cuando hay flecha/marca a la vista.
+        if SAVE_DEBUG_FRAMES and m_marca_roi.any():
+            self._guardar_dbg(cv_image, roi, m_linea, m_marca, endpoints, escena)
+
+        # PRIORIDAD 1: esquivar el obstaculo. Al esquivar se abandona cualquier memoria de cruce, para que no se vaya a la salida equivocada por un error de percepcion durante el giro.
         if self._avoid_obstacle():
             self._cross_steps = 0
             self._cross_label = 'none'
             if DEBUG_VIEW:
                 self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
             return
-
-        # Si vemos una flecha en un cruce, decidimos la direccion (left/straight/
-        # right). La decision se FIJA con la mejor vista de la flecha (la de mayor
-        # area), no con cualquier frame parcial, para no salir por una lateral en
-        # un cruce recto solo porque la flecha se vea a medias. Mientras la flecha
-        # sea visible se refresca la memoria; al perderla, el robot sigue
-        # comprometido CROSS_COMMIT_STEPS pasos mas, asi NO escoge la rama al azar.
+        
         if 'cruce' in escena and m_marca_roi.any():
             blob = mayor_blob(m_marca_roi)
             arrow_info = orientacion_flecha(blob)
@@ -757,10 +752,6 @@ class BrainFinalExam(Brain):
         # PRIORIDAD 2: resolver el cruce usando la direccion MEMORIZADA.
         if self._cross_steps > 0:
             self._cross_steps -= 1
-            # Reproyecta la direccion fijada sobre los endpoints actuales, pero
-            # SOLO si es coherente con el sentido comprometido. Asi 'left' siempre
-            # gira a la izda (err<0) aunque una reproyeccion espuria diera err>0
-            # (lo que antes hacia que se fuera al lado contrario).
             sal_mem = salida_de_label(endpoints, self._cross_label, x_centro)
             if sal_mem is not None:
                 new_err = sal_mem['pt'][0] - x_centro
@@ -777,8 +768,6 @@ class BrainFinalExam(Brain):
                   % (self._cross_label, self._cross_side, self._cross_steps,
                      self._cross_err, forward, turn))
 
-            # Libera la memoria cuando ya hay una sola linea (re)centrada: el
-            # robot ya esta encarrilado en la rama correcta.
             if (escena in ('linea recta', 'curva izda', 'curva dcha')
                     and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
                 self._cross_steps = 0
@@ -799,19 +788,9 @@ class BrainFinalExam(Brain):
                     print("MARCA  | detectada: %s" % marca)
                     self._last_mark = marca
 
-        # PRIORIDAD 4: red de seguridad con findLineDeviation, luego buscar.
+        # PRIORIDAD 4: la segmentacion no encuentra la linea -> buscarla.
         else:
-            found = False
-            if _HAS_FOLLOWLINE:
-                found, err_fl = findLineDeviation(gray)
-                if found:
-                    forward, turn = self._control_pd(err_fl * (W / 2.0), W)
-                    self._lost_line_steps = 0
-                    self.move(forward, turn)
-                    print("FOLLOW(fallback) | err=%.3f v=%.2f w=%.2f"
-                          % (err_fl, forward, turn))
-            if not found:
-                self._buscar_linea()
+            self._buscar_linea()
                 
         if DEBUG_VIEW:
             self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
