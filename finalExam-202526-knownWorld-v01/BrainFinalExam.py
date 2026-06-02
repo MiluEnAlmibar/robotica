@@ -52,14 +52,7 @@ PROC_WIDTH = 320
 # Mostrar ventanas de depuracion con opencv. IMPORTANTE: en el robot fisico,
 # conectado por 'ssh -X', cada imshow reenvia el frame por red y RALENTIZA mucho
 # el bucle de control. Ponlo a False al ejecutar en el robot.
-DEBUG_VIEW = False
-
-# Guardar a disco frames anotados (linea/marca/ROI/endpoints) cuando hay una
-# flecha visible, para diagnosticar por que no se detecta el cruce en el robot.
-# Genera dbg_000.png, dbg_001.png ... (hasta SAVE_DEBUG_MAX). Ponlo a False en
-# uso normal. Util porque por 'ssh -X' no se pueden ver ventanas con fluidez.
-SAVE_DEBUG_FRAMES = False
-SAVE_DEBUG_MAX = 40
+DEBUG_VIEW = True
 
 # Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
 # no hay objeto circular, asi que por defecto esta desactivado. Ponlo a True si
@@ -158,11 +151,10 @@ def endpoints_en_roi(m_linea, roi, grosor=4):
     """Endpoints donde la linea cruza los 4 bordes de la ROI.
     Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}.
 
-    Cada borde se mira como una BANDA de `grosor` pixeles (no una sola linea):
-    basta con que haya pixel de linea en cualquier fila/columna de la banda para
-    contar el cruce. Asi una rama que no llega justo al pixel del borde, o con
-    pequenos huecos de segmentacion, sigue generando endpoint (antes era muy
-    fragil y no se detectaba el cruce)."""
+    Cada borde se mira como una BANDA de `grosor` pixeles (no una sola fila):
+    basta con que haya pixel de linea en CUALQUIER fila/columna de la banda para
+    contar el cruce. Asi la segmentacion no necesita llegar al pixel exacto del
+    borde para detectar el endpoint."""
     y0, y1, x0, x1 = roi
     sub = m_linea[y0:y1, x0:x1]
     H, W = sub.shape
@@ -170,9 +162,9 @@ def endpoints_en_roi(m_linea, roi, grosor=4):
 
     borders = [
         ('bottom', sub[H - g:, :].any(axis=0), lambda m: (x0 + m, y0 + H - 1), 'entrada'),
-        ('top',    sub[:g, :].any(axis=0),     lambda m: (x0 + m, y0),         'salida'),
-        ('left',   sub[:, :g].any(axis=1),     lambda m: (x0, y0 + m),         'salida'),
-        ('right',  sub[:, W - g:].any(axis=1), lambda m: (x0 + W - 1, y0 + m), 'salida'),
+        ('top',    sub[:g, :].any(axis=0),      lambda m: (x0 + m, y0),          'salida'),
+        ('left',   sub[:, :g].any(axis=1),      lambda m: (x0, y0 + m),          'salida'),
+        ('right',  sub[:, W - g:].any(axis=1),  lambda m: (x0 + W - 1, y0 + m), 'salida'),
     ]
 
     endpoints = []
@@ -281,49 +273,32 @@ def salida_de_label(endpoints, label, xc):
     return min(cand, key=lambda e: abs(e['pt'][0] - xc))
 
 
-def salida_elegida(arrow_info, endpoints, roi):
-    """(Criterio del notebook 02) Salida cuya direccion desde el centroide de la
-    flecha forma el menor angulo con el vector centroide->punta (maxima cosine).
-    Devuelve el dict de salida o None."""
-    if arrow_info is None:
-        return None
-    y0, _, x0, _ = roi
-    cx, cy, tx, ty = arrow_info
-    vx, vy = tx - cx, ty - cy
-    n = np.hypot(vx, vy)
-    if n < 1e-6:
-        return None
-    vx, vy = vx / n, vy / n
-    cgx, cgy = cx + x0, cy + y0
-    salidas = [e for e in endpoints if e['role'] == 'salida']
-    if not salidas:
-        return None
+def salida_por_flecha(arrow_info, endpoints, roi, deadzone_deg=35.0):
+    """Decide la salida en un cruce a partir de la inclinacion de la flecha.
 
-    def cos_ang(s):
-        dx, dy = s['pt'][0] - cgx, s['pt'][1] - cgy
-        d = np.hypot(dx, dy)
-        return (dx * vx + dy * vy) / d if d > 1e-6 else -2.0
-
-    return max(salidas, key=cos_ang)
-
-
-def salida_por_flecha(arrow_info, endpoints, roi, deadzone_px_frac=0.10):
-    """Elige la salida con el criterio del notebook (maxima alineacion con la
-    flecha) y deriva una etiqueta 'left'/'straight'/'right' SOLO para la memoria
-    del cruce (reproyeccion + coherencia de signo cuando la flecha ya no se ve).
+    En vez de la similitud de coseno (fragil cuando la flecha se ve parcial),
+    clasificamos la flecha en 'left' / 'straight' / 'right' segun cuanto se
+    inclina respecto a la vertical de la imagen, con una zona muerta amplia a
+    favor de 'recto'. Asi una flecha casi vertical (recta), aunque se vea a
+    medias, no se confunde con una salida lateral.
 
     Devuelve (salida_dict, label) o (None, 'none')."""
-    sal = salida_elegida(arrow_info, endpoints, roi)
-    if sal is None:
+    if arrow_info is None:
         return None, 'none'
-    xc = (roi[2] + roi[3]) / 2.0
-    margen = (roi[3] - roi[2]) * deadzone_px_frac   # zona muerta de 'recto' en px
-    dx = sal['pt'][0] - xc
-    if sal['side'] == 'top' or abs(dx) <= margen:
+    cx, cy, tx, ty = arrow_info
+    vx, vy = tx - cx, ty - cy
+    # Inclinacion respecto a la vertical (0 = vertical/recto, 90 = horizontal).
+    # Usamos valores absolutos para ignorar el signo (la punta puede salir hacia
+    # arriba o hacia abajo segun el recorte del blob).
+    lean = np.degrees(np.arctan2(abs(vx), abs(vy) + 1e-9))
+    if lean < deadzone_deg:
         label = 'straight'
+    elif vx < 0:
+        label = 'left'
     else:
-        label = 'left' if dx < 0 else 'right'
-    return sal, label
+        label = 'right'
+    xc = (roi[2] + roi[3]) / 2.0
+    return salida_de_label(endpoints, label, xc), label
 
 
 def error_seguimiento(m_linea, roi, alto_franja=15):
@@ -482,7 +457,6 @@ class KNNMarcas:
         clase = np.bincount(vecinos).argmax()
         return self.clases[clase]
 
-
 # =============================================================================
 # BRAIN
 # =============================================================================
@@ -501,15 +475,14 @@ class BrainFinalExam(Brain):
     MED_RIGHT = -0.5
     HARD_RIGHT = -1.0
 
-    OBSTACLE_STOP = 0.40
-    OBSTACLE_WARN = 0.65
-    OBSTACLE_EMERGENCY = 0.25
+    OBSTACLE_STOP = 0.40   # caja de frente -> girar fuerte avanzando despacio
+    OBSTACLE_WARN = 0.65   # caja al costado -> girar fuerte avanzando medio
 
-    AVOID_PREFER = 'left'
-
+    # Ganancias del control PD de seguimiento (como BrainFollowLine).
     LINE_KP = 0.9
     LINE_KD = 0.5
 
+    # Velocidades del controlador visual.
     V_MAX = 0.7
     V_MIN = 0.05
 
@@ -519,26 +492,32 @@ class BrainFinalExam(Brain):
 
     CROSS_COMMIT_STEPS = 22
     CROSS_RELEASE_PX = 45
-    STRAIGHT_DEADZONE_FRAC = 0.15
+    STRAIGHT_DEADZONE_DEG = 35
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
         self._lost_line_steps = 0
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
-        self._dbg_n = 0                # contador de frames de diagnostico guardados
 
-        self.capture = cv2.VideoCapture(CAMERA_INDEX)
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        if self.capture.isOpened():
-            print("[FinalExam] Camara del Pioneer (C920 USB) abierta (index %d)." % CAMERA_INDEX)
+        # Fuente de imagen: camara del robot (simulador) o camara USB (robot
+        # fisico). Se usa la USB si se pide explicitamente (USE_ROBOT_CAMERA=False)
+        # o si el robot no expone getImage() (p.ej. el AriaRobot del Pioneer, cuya
+        # camara C920 es un webcam USB aparte): asi funciona en ambos sin tocar el
+        # flag.
+        self.capture = None
+        use_usb = (not USE_ROBOT_CAMERA) or (not hasattr(self.robot, 'getImage'))
+        if use_usb:
+            self.capture = cv2.VideoCapture(CAMERA_INDEX)
+            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            if self.capture.isOpened():
+                print("[FinalExam] Camara USB abierta (index %d)." % CAMERA_INDEX)
+            else:
+                print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX,
+                      "- prueba otro CAMERA_INDEX (1, 2, ...).")
         else:
-            print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX,
-                  "- prueba otro CAMERA_INDEX (1, 2, ...).")
-
-        # Sentido de esquiva fijado (latch): 0 = sin esquiva en curso.
-        self._avoid_turn = 0
+            print("[FinalExam] Usando la camara del robot (getImage).")
 
         # Memoria del cruce en curso.
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
@@ -598,34 +577,15 @@ class BrainFinalExam(Brain):
         front = self._min_range("front")
         front_left = self._min_range("front-left")
         front_right = self._min_range("front-right")
-        left = self._min_range("left")
-        right = self._min_range("right")
 
-        girando_cruce = self._cross_steps > 0
-        stop = self.OBSTACLE_EMERGENCY if girando_cruce else self.OBSTACLE_STOP
-
-        if front < stop:
-            if self._avoid_turn == 0:
-                if self.AVOID_PREFER == 'left':
-                    self._avoid_turn = self.HARD_LEFT
-                elif self.AVOID_PREFER == 'right':
-                    self._avoid_turn = self.HARD_RIGHT
-                else:
-                    libre_izda = min(front_left, left)
-                    libre_dcha = min(front_right, right)
-                    self._avoid_turn = (self.HARD_LEFT if libre_izda >= libre_dcha
-                                        else self.HARD_RIGHT)
-            self.move(self.SLOW_FORWARD, self._avoid_turn)
-            print("AVOID | front=%.2f -> %s%s (libre izda=%.2f dcha=%.2f)"
-                  % (front, "izda" if self._avoid_turn > 0 else "dcha",
-                     " (emergencia)" if girando_cruce else "",
-                     min(front_left, left), min(front_right, right)))
+        # Caja de frente: girar FUERTE hacia el lado mas libre, avanzando despacio.
+        if front < self.OBSTACLE_STOP:
+            if front_left < front_right:
+                self.move(self.SLOW_FORWARD, self.HARD_RIGHT)
+            else:
+                self.move(self.SLOW_FORWARD, self.HARD_LEFT)
+            print("AVOID | front=%.2f gira fuerte" % front)
             return True
-
-        # Frente despejado: termina la esquiva (suelta el latch).
-        self._avoid_turn = 0
-        if girando_cruce:
-            return False   # durante el giro ignoramos los avisos laterales
 
         # Caja al costado: seguir avanzando pero girando fuerte para apartarse.
         if front_left < self.OBSTACLE_WARN:
@@ -684,40 +644,14 @@ class BrainFinalExam(Brain):
         norm = cv2.medianBlur(norm, 5)
         return self.knn.predict(hu_descriptor(norm))
 
-    # --- diagnostico a disco --------------------------------------------
-    def _guardar_dbg(self, cv_image, roi, m_linea, m_marca, endpoints, escena):
-        """Guarda un frame anotado (linea/marca/ROI/endpoints) para ver por que
-        no se detecta el cruce. Solo si SAVE_DEBUG_FRAMES y hasta SAVE_DEBUG_MAX."""
-        if self._dbg_n >= SAVE_DEBUG_MAX:
-            return
-        vis = cv_image.copy()
-        vis[m_linea] = (0, 255, 0)        # linea segmentada en verde
-        vis[m_marca] = (0, 0, 255)        # marca/flecha en rojo
-        y0, y1, x0, x1 = roi
-        cv2.rectangle(vis, (x0, y0), (x1 - 1, y1 - 1), (255, 0, 0), 1)
-        for e in endpoints:
-            col = (0, 255, 255) if e['role'] == 'entrada' else (255, 0, 255)
-            cv2.circle(vis, e['pt'], 5, col, -1)
-            cv2.putText(vis, e['side'][:1], (e['pt'][0] + 4, e['pt'][1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1)
-        cv2.putText(vis, "%s  n_ep=%d" % (escena, len(endpoints)), (3, 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-        fn = "dbg_%03d.png" % self._dbg_n
-        cv2.imwrite(fn, vis)
-        print("DBG    | %s  escena=%s  n_ep=%d  bordes=%s"
-              % (fn, escena, len(endpoints), [e['side'] for e in endpoints]))
-        self._dbg_n += 1
-
     # --- bucle principal -------------------------------------------------
     def step(self):
         cv_image = self._get_image()
-        if cv_image is None:
+        if cv_image is None:                 # sin frame (camara no lista): parar y reintentar
             self.move(self.NO_FORWARD, self.NO_TURN)
             return
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB) if CAMERA_RETURNS_BGR else cv_image
 
-        # PERCEPCION: segmentar y analizar la escena (antes que la evasion, para
-        # que el rodeo sepa cuando la linea vuelve a estar centrada).
         roi = get_roi(rgb.shape)
         etiquetas = segmentar(rgb)
         m_linea, m_marca = mascaras(etiquetas)
@@ -729,23 +663,18 @@ class BrainFinalExam(Brain):
         W = rgb.shape[1]
         arrow_info, salida = None, None
 
-        # Diagnostico: guardar el frame anotado cuando hay flecha/marca a la vista.
-        if SAVE_DEBUG_FRAMES and m_marca_roi.any():
-            self._guardar_dbg(cv_image, roi, m_linea, m_marca, endpoints, escena)
-
-        # PRIORIDAD 1: esquivar el obstaculo. Al esquivar se abandona cualquier memoria de cruce, para que no se vaya a la salida equivocada por un error de percepcion durante el giro.
         if self._avoid_obstacle():
             self._cross_steps = 0
             self._cross_label = 'none'
             if DEBUG_VIEW:
                 self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
             return
-        
+
         if 'cruce' in escena and m_marca_roi.any():
             blob = mayor_blob(m_marca_roi)
             arrow_info = orientacion_flecha(blob)
             salida, label = salida_por_flecha(arrow_info, endpoints, roi,
-                                              self.STRAIGHT_DEADZONE_FRAC)
+                                              self.STRAIGHT_DEADZONE_DEG)
             if salida is not None:
                 area = int(blob.sum())
                 if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
@@ -774,7 +703,6 @@ class BrainFinalExam(Brain):
             print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
                   % (self._cross_label, self._cross_side, self._cross_steps,
                      self._cross_err, forward, turn))
-
             if (escena in ('linea recta', 'curva izda', 'curva dcha')
                     and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
                 self._cross_steps = 0
@@ -795,10 +723,10 @@ class BrainFinalExam(Brain):
                     print("MARCA  | detectada: %s" % marca)
                     self._last_mark = marca
 
-        # PRIORIDAD 4: la segmentacion no encuentra la linea -> buscarla.
+        # PRIORIDAD 4: buscar linea
         else:
             self._buscar_linea()
-                
+
         if DEBUG_VIEW:
             self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
 
