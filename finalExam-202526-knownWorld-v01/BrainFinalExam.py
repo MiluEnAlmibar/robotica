@@ -36,11 +36,30 @@ except Exception:
 # =============================================================================
 
 # getImage() de pyrobot devuelve BGR (por eso el Brain original hace BGR2GRAY).
-# segmentar() espera RGB (igual que iio.imread en el notebook). Si en tu VM los
-# colores salieran invertidos (la linea se clasifica como marca, etc.), pon False.
+# segmentar() espera RGB (igual que iio.imread en el notebook). Si los colores
+# salieran invertidos (la linea se clasifica como marca, etc.), pon False.
 CAMERA_RETURNS_BGR = True
 
-# Mostrar ventanas de depuracion con opencv.
+# Fuente de imagen:
+#   True  -> camara del robot via pyrobot (self.robot.getImage()). Usar en el
+#            SIMULADOR Stage.
+#   False -> camara USB via OpenCV (cv2.VideoCapture). Usar en el ROBOT FISICO:
+#            la Logitech C920 es un webcam aparte, no la gestiona el driver Aria.
+USE_ROBOT_CAMERA = True
+CAMERA_INDEX = 0       # indice de la camara USB (0 = la primera) si USE_ROBOT_CAMERA=False
+# La C920 captura en 16:9 (640x360 es su resolucion mas baja); 320x240 (4:3) del
+# simulador no es nativo. Estos valores solo aplican a la camara USB.
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 360
+
+# Ancho al que se reescala el frame ANTES de procesarlo. Mantiene la CPU ligera
+# (el PC del robot es modesto) y conserva validos los umbrales en pixeles que se
+# afinaron a ~320 px. El simulador ya viene a 320, asi que no le afecta.
+PROC_WIDTH = 320
+
+# Mostrar ventanas de depuracion con opencv. IMPORTANTE: en el robot fisico,
+# conectado por 'ssh -X', cada imshow reenvia el frame por red y RALENTIZA mucho
+# el bucle de control. Ponlo a False al ejecutar en el robot.
 DEBUG_VIEW = True
 
 # Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
@@ -478,6 +497,15 @@ class BrainFinalExam(Brain):
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
 
+        # Fuente de imagen: camara del robot (sim) o camara USB (robot fisico).
+        self.capture = None
+        if not USE_ROBOT_CAMERA:
+            self.capture = cv2.VideoCapture(CAMERA_INDEX)
+            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            if not self.capture.isOpened():
+                print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX)
+
         # Memoria del cruce en curso.
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
         self._cross_side = None        # lado de la salida elegida ('top'/'left'/'right')
@@ -498,7 +526,24 @@ class BrainFinalExam(Brain):
                   "Copia la carpeta junto al Brain o define MARCAS_DIR.")
 
     def destroy(self):
+        if getattr(self, 'capture', None) is not None:
+            self.capture.release()
         cv2.destroyAllWindows()
+
+    def _get_image(self):
+        """Captura un frame BGR de la fuente configurada (camara USB del robot
+        fisico o camara del robot via pyrobot en el simulador) y lo reescala a
+        PROC_WIDTH para aligerar el procesamiento."""
+        if self.capture is not None:
+            ok, frame = self.capture.read()
+            if not ok:
+                return None
+        else:
+            frame = self.robot.getImage()
+        if frame is not None and PROC_WIDTH and frame.shape[1] > PROC_WIDTH:
+            h = int(frame.shape[0] * PROC_WIDTH / float(frame.shape[1]))
+            frame = cv2.resize(frame, (PROC_WIDTH, h))
+        return frame
 
     # --- sonar -----------------------------------------------------------
     def _min_range(self, group_name, default=3.0):
@@ -588,7 +633,10 @@ class BrainFinalExam(Brain):
 
     # --- bucle principal -------------------------------------------------
     def step(self):
-        cv_image = self.robot.getImage()
+        cv_image = self._get_image()
+        if cv_image is None:                 # sin frame (camara no lista): parar y reintentar
+            self.move(self.NO_FORWARD, self.NO_TURN)
+            return
         rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB) if CAMERA_RETURNS_BGR else cv_image
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
 
