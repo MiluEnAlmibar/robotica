@@ -58,11 +58,6 @@ DEBUG_VIEW = True
 # CRUCE, SEARCH y AVOID. Util cuando solo interesa el resultado de clasificacion.
 PRINT_ONLY_MARCA = False
 
-# Activar deteccion de circulo + distancia (practica 03). En este mundo conocido
-# no hay objeto circular, asi que por defecto esta desactivado. Ponlo a True si
-# usas un mundo con un circulo/pelota.
-ENABLE_CIRCLE = False
-
 # Centroides del NearestCentroid entrenado en 02_analisis_escena.ipynb,
 # en espacio rg-normalizado. Orden: marca(rojo), fondo, linea(azul).
 CENTROIDES = np.array([
@@ -83,12 +78,6 @@ MARCAS_DIR_CANDIDATAS = [
     os.path.join(_AQUI, '..', '..', 'images', 'marcas'),
 ]
 EXTS_IMG = {'.png', '.jpg', '.jpeg', '.bmp'}
-
-# Parametros del modelo pinhole para el circulo (practica 03).
-FOCAL_PX = 360.0
-DIAMETRO_REAL_MM = 65.0
-MIN_CIRCULARIDAD = 0.70
-MIN_AREA_PX_CIRC = 500
 
 
 # =============================================================================
@@ -119,8 +108,10 @@ def mascaras(etiquetas):
     return (etiquetas == CLASE_LINEA), (etiquetas == CLASE_MARCA)
 
 
-def get_roi(shape, franja=0.75, anticipacion=0.0):
-    """Franja horizontal central (75% del alto por defecto)."""
+def get_roi(shape, franja=0.9, anticipacion=0.0):
+    """Franja horizontal central (90% del alto por defecto). Mas ancha que antes
+    para captar la rama perpendicular del cruce, que aparece arriba en la imagen
+    y antes quedaba fuera de la ROI."""
     H, W = shape[:2]
     alto = int(H * franja)
     centro = H // 2 - int(H * anticipacion)
@@ -326,6 +317,12 @@ def error_seguimiento(m_linea, roi, alto_franja=15):
     return xs.mean() - W / 2.0, xs.mean(), W / 2.0
 
 
+def ang_diff(a, b):
+    """Diferencia angular absoluta (grados) en [0, 180], con envolvente 360."""
+    d = abs(a - b) % 360.0
+    return d if d <= 180.0 else 360.0 - d
+
+
 # =============================================================================
 # CLASIFICADOR DE MARCAS  (Hu Moments + KNN, de 02_analisis_escena.ipynb #11)
 # =============================================================================
@@ -476,7 +473,6 @@ class BrainFinalExam(Brain):
     VERY_SLOW_FORWARD = 0.05
     SLOW_FORWARD = 0.1
     MED_FORWARD = 0.5
-    FULL_FORWARD = 1.0
 
     NO_TURN = 0
     MED_LEFT = 0.5
@@ -492,16 +488,25 @@ class BrainFinalExam(Brain):
     LINE_KD = 0.5
 
     # Velocidades del controlador visual.
-    V_MAX = 0.7
+    V_MAX = 0.4    # el robot real es rapido (move=1.0 -> 1.4 m/s); a 0.7 pasaba
+                   # los cruces antes de poder detectarlos. Mas lento = mas fiable.
     V_MIN = 0.05
+    # Al ver una flecha (cerca de un cruce) se frena a esta velocidad para dar
+    # tiempo a detectar la rama perpendicular y comprometer el giro.
+    APPROACH_FORWARD = 0.12
 
     # Busqueda de linea perdida.
     SEARCH_SLOW_AFTER = 15
     SEARCH_REVERSE_AFTER = 35
 
-    CROSS_COMMIT_STEPS = 30   # pasos maximos de giro (liberacion anticipada si linea aparece en el lado correcto)
-    CROSS_RELEASE_PX = 60      # umbral (px): libera 'straight'; para lateral, se usa CROSS_RELEASE_PX//2
+    CROSS_COMMIT_STEPS = 30   # tope de pasos del giro (red de seguridad si no hay odometria)
+    CROSS_RELEASE_PX = 60      # umbral (px): libera 'straight' cuando la linea esta centrada
     STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta" (igual que el sim)
+    # Giro lateral (90°) por ODOMETRIA: se gira duro hasta haber rotado este
+    # angulo y entonces se suelta a seguir la rama nueva. Asi no depende de
+    # calibrar pasos (no se pasa ni se queda corto). Si no hay odometria, cae al
+    # tope de CROSS_COMMIT_STEPS.
+    CROSS_TURN_DEG = 80
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
@@ -534,6 +539,12 @@ class BrainFinalExam(Brain):
         self._cross_err = 0.0          # ultimo error conocido hacia esa salida (px)
         self._cross_best_area = 0      # mayor area de flecha vista en este cruce
         self._cross_label = 'none'     # 'left'/'straight'/'right' decidido
+        self._cross_th0 = None         # rumbo al iniciar el giro (para el giro por odometria)
+
+        # Comprobar si hay odometria (rumbo) disponible para el giro de 90°.
+        h = self._heading()
+        print("[FinalExam] Odometria (rumbo):",
+              ("%.1f deg" % h) if h is not None else "NO disponible -> giro por pasos")
 
         # Clasificador de marcas: si hay carpeta images/marcas/ se entrena de ella
         # (util para re-entrenar con fotos reales); si no, usa los descriptores
@@ -570,6 +581,25 @@ class BrainFinalExam(Brain):
             h = int(frame.shape[0] * PROC_WIDTH / float(frame.shape[1]))
             frame = cv2.resize(frame, (PROC_WIDTH, h))
         return frame
+
+    # --- odometria -------------------------------------------------------
+    def _heading(self):
+        """Rumbo del robot en grados (de la odometria), o None si no esta
+        disponible. Prueba varias APIs de pyrobot segun el robot/driver."""
+        r = self.robot
+        for getter in (
+            lambda: r.th,                       # pyrobot: grados
+            lambda: np.degrees(r.thr),          # pyrobot: radianes
+            lambda: r.get('robot/th'),
+            lambda: r.getPose()[2],
+        ):
+            try:
+                v = getter()
+                if v is not None:
+                    return float(v)
+            except Exception:
+                pass
+        return None
 
     # --- sonar -----------------------------------------------------------
     def _min_range(self, group_name, default=3.0):
@@ -670,7 +700,7 @@ class BrainFinalExam(Brain):
         m_linea, m_marca = mascaras(etiquetas)
         endpoints = endpoints_en_roi(m_linea, roi)
         escena = clasifica_escena(endpoints)
-        err_px, x_linea, x_centro = error_seguimiento(m_linea, roi)
+        err_px, _, x_centro = error_seguimiento(m_linea, roi)
 
         m_marca_roi = aplicar_roi(m_marca, roi)
         W = rgb.shape[1]
@@ -693,6 +723,7 @@ class BrainFinalExam(Brain):
                 area = int(blob.sum())
                 if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
                     self._cross_best_area = 0
+                    self._cross_th0 = self._heading()   # rumbo de referencia del giro
                 if area >= self._cross_best_area:    # solo la mejor vista fija la direccion
                     self._cross_best_area = area
                     self._cross_label = label
@@ -712,8 +743,8 @@ class BrainFinalExam(Brain):
                     self._cross_err = new_err
                     self._cross_side = sal_mem['side']
 
-            # Para giros laterales (90°) forzamos giro DURO con velocidad reducida.
-            # El PD solo se usa en 'straight' donde la salida esta casi centrada.
+            # Para giros laterales (90°) giramos DURO (inmune al parpadeo de la
+            # deteccion); en 'straight' usamos el PD hacia la salida centrada.
             if self._cross_label == 'left':
                 forward, turn = self.SLOW_FORWARD, self.HARD_LEFT
             elif self._cross_label == 'right':
@@ -723,27 +754,44 @@ class BrainFinalExam(Brain):
 
             self._lost_line_steps = 0
             self.move(forward, turn)
+
+            # Cuanto ha rotado ya el robot desde que empezo el giro (odometria).
+            th = self._heading()
+            girado = (ang_diff(th, self._cross_th0)
+                      if (th is not None and self._cross_th0 is not None) else None)
+
             if not PRINT_ONLY_MARCA:
-                print("CRUCE  | %s side=%s steps=%d err=%.1f v=%.2f w=%.2f"
+                print("CRUCE  | %s side=%s steps=%d girado=%s v=%.2f w=%.2f"
                       % (self._cross_label, self._cross_side, self._cross_steps,
-                         self._cross_err, forward, turn))
+                         ("%.0f" % girado) if girado is not None else "-", forward, turn))
 
             # Liberacion del cruce:
-            # - 'straight': se libera cuando la linea esta centrada.
-            # - 'left'/'right': NO se libera por error de linea; cualquier linea
-            #   visible durante el giro puede cumplir el umbral prematuramente.
-            #   Se libera SOLO cuando _cross_steps llega a 0 (tiempo suficiente
-            #   para completar el giro de 90°).
-            if (self._cross_label == 'straight'
-                    and escena in ('linea recta', 'curva izda', 'curva dcha')
+            #  - lateral: cuando se ha ROTADO ~CROSS_TURN_DEG (odometria) -> ya
+            #    encarrilado en la rama nueva. Si no hay odometria, al agotar pasos.
+            #  - straight: cuando la linea vuelve a estar centrada.
+            #  - tope de seguridad: _cross_steps llega a 0.
+            soltar = self._cross_steps <= 0
+            if self._cross_label in ('left', 'right'):
+                if girado is not None and girado >= self.CROSS_TURN_DEG:
+                    soltar = True
+            elif (escena in ('linea recta', 'curva izda', 'curva dcha')
                     and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
+                soltar = True
+
+            if soltar:
                 self._cross_steps = 0
                 self._cross_side = None
                 self._cross_label = 'none'
+                self._cross_th0 = None
 
         # PRIORIDAD 3: seguir la linea (PD sobre el error de segmentacion).
         elif err_px is not None:
             forward, turn = self._control_pd(err_px, W)
+            # Si hay una flecha a la vista (estamos cerca de un cruce) pero aun se
+            # ve como 'linea recta', FRENAR para dar tiempo a que la rama
+            # perpendicular entre en la ROI y se detecte el cruce antes de pasarlo.
+            if m_marca_roi.any():
+                forward = min(forward, self.APPROACH_FORWARD)
             self._lost_line_steps = 0
             self.move(forward, turn)
             if not PRINT_ONLY_MARCA:
