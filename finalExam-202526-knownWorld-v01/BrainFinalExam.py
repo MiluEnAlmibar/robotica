@@ -522,6 +522,11 @@ class BrainFinalExam(Brain):
     # que el sonar solo "ve" el obstaculo.
     OBSTACLE_STOP = 0.40   # caja de frente -> girar fuerte avanzando despacio
     OBSTACLE_WARN = 0.65   # caja al costado -> girar fuerte avanzando medio
+    # Mientras se gira en un cruce, solo se esquiva si la caja esta MAS cerca que
+    # esto (emergencia). Asi el giro de la flecha (que aleja al robot de la caja)
+    # se completa "encima del cruce" en vez de que el AVOID lo aborte demasiado
+    # pronto. Subelo si el robot grande llega a rozar la caja al girar.
+    OBSTACLE_EMERGENCY = 0.25
 
     # Ganancias del control PD de seguimiento (como BrainFollowLine).
     LINE_KP = 0.9
@@ -630,14 +635,25 @@ class BrainFinalExam(Brain):
         front_left = self._min_range("front-left")
         front_right = self._min_range("front-right")
 
+        # Si estamos girando en un cruce, relajar la evasion a solo EMERGENCIA:
+        # umbral frontal mas corto y sin avisos laterales. Asi el giro se completa
+        # encima del cruce (alejando al robot de la caja) en lugar de que el AVOID
+        # lo aborte demasiado pronto (el robot real es grande y ve la caja antes).
+        girando_cruce = self._cross_steps > 0
+        stop = self.OBSTACLE_EMERGENCY if girando_cruce else self.OBSTACLE_STOP
+
         # Caja de frente: girar FUERTE hacia el lado mas libre, avanzando despacio.
-        if front < self.OBSTACLE_STOP:
+        if front < stop:
             if front_left < front_right:
                 self.move(self.SLOW_FORWARD, self.HARD_RIGHT)
             else:
                 self.move(self.SLOW_FORWARD, self.HARD_LEFT)
-            print("AVOID | front=%.2f gira fuerte" % front)
+            print("AVOID | front=%.2f gira fuerte%s"
+                  % (front, " (emergencia)" if girando_cruce else ""))
             return True
+
+        if girando_cruce:
+            return False   # durante el giro ignoramos los avisos laterales
 
         # Caja al costado: seguir avanzando pero girando fuerte para apartarse.
         if front_left < self.OBSTACLE_WARN:
