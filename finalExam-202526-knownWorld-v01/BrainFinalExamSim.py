@@ -199,6 +199,23 @@ def mayor_blob(mask_bool):
     return labels == idx
 
 
+def blob_mayor_toca_borde(mask_bool):
+    """True si el blob mayor toca alguno de los 4 bordes del recorte ROI.
+    Un blob que corta el borde esta probablemente cortado por el encuadre
+    (p.ej. la flecha entrando al ROI) y no debe usarse para clasificar la marca."""
+    m = mask_bool.astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num <= 1:
+        return False
+    H, W = m.shape
+    idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x = stats[idx, cv2.CC_STAT_LEFT]
+    y = stats[idx, cv2.CC_STAT_TOP]
+    w = stats[idx, cv2.CC_STAT_WIDTH]
+    h = stats[idx, cv2.CC_STAT_HEIGHT]
+    return x == 0 or y == 0 or (x + w) >= W or (y + h) >= H
+
+
 def orientacion_flecha(m_marca_roi, area_min=30):
     """Orientacion de la flecha por tensor de inercia (algoritmo del notebook).
     Devuelve (cx, cy, tx, ty) en coords de la ROI, o None."""
@@ -590,8 +607,14 @@ class BrainFinalExam(Brain):
     # --- clasificacion de marca -----------------------------------------
     def _clasificar_marca(self, m_marca_roi):
         """Clasifica la marca con votacion sobre los ultimos MARCA_VOTES frames.
-        Solo confirma cuando una clase gana la mayoria absoluta del buffer."""
+        Solo confirma cuando una clase gana la mayoria absoluta del buffer.
+        Descarta el frame si el blob mayor toca el borde del ROI (imagen cortada)."""
         if not self.knn.ok:
+            return None
+        # Si el blob rojo mayor corta el borde del ROI, la vista es parcial
+        # (p.ej. la flecha entrando al encuadre): no contar hacia la clasificacion.
+        if blob_mayor_toca_borde(m_marca_roi):
+            self._marca_votes = []
             return None
         mask = m_marca_roi.astype(np.uint8) * 255
         limpia = extraer_marca_binaria(mask)

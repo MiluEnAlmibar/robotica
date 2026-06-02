@@ -204,15 +204,20 @@ def clasifica_escena(endpoints, umbral_curvatura=10):
     return 'curva izda' if dx_ie < 0 else 'curva dcha'
 
 
+ARROW_MIN_AREA = 400  # px: area minima del blob para considerarlo una flecha real
+
 def mayor_blob(mask_bool):
     """Mascara booleana con SOLO la mayor componente conexa (para aislar la
-    flecha de otras manchas rojas que pueda haber en la ROI)."""
+    flecha de otras manchas rojas que pueda haber en la ROI).
+    Devuelve None si la mayor componente no supera ARROW_MIN_AREA."""
     m = mask_bool.astype(np.uint8)
     num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     if num <= 1:
-        return mask_bool
+        return None
     # componente 0 = fondo; elegir la de mayor area
     idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if stats[idx, cv2.CC_STAT_AREA] < ARROW_MIN_AREA:
+        return None
     return labels == idx
 
 
@@ -496,7 +501,7 @@ class BrainFinalExam(Brain):
 
     CROSS_COMMIT_STEPS = 30   # pasos maximos de giro (liberacion anticipada si linea aparece en el lado correcto)
     CROSS_RELEASE_PX = 60      # umbral (px): libera 'straight'; para lateral, se usa CROSS_RELEASE_PX//2
-    STRAIGHT_DEADZONE_DEG = 20  # zona muerta mas estrecha: 90° left no se confunde con recto
+    STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta" (igual que el sim)
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
@@ -680,10 +685,11 @@ class BrainFinalExam(Brain):
 
         if 'cruce' in escena and m_marca_roi.any():
             blob = mayor_blob(m_marca_roi)
-            arrow_info = orientacion_flecha(blob)
+            if blob is not None:
+                arrow_info = orientacion_flecha(blob)
             salida, label = salida_por_flecha(arrow_info, endpoints, roi,
                                               self.STRAIGHT_DEADZONE_DEG)
-            if salida is not None:
+            if salida is not None and blob is not None:
                 area = int(blob.sum())
                 if self._cross_steps == 0:          # cruce nuevo: reinicia la mejor vista
                     self._cross_best_area = 0
@@ -722,26 +728,18 @@ class BrainFinalExam(Brain):
                       % (self._cross_label, self._cross_side, self._cross_steps,
                          self._cross_err, forward, turn))
 
-            # Liberacion del cruce: diferenciamos por direccion.
-            # - 'straight': se libera cuando la linea esta centrada (comportamiento original).
-            # - 'left'/'right': la condicion abs(err)<umbral tambien se cumple con
-            #   la rama RECTA mientras el robot gira -> liberacion prematura.
-            #   Solo liberamos cuando la linea esta del lado correcto (el giro termino).
-            if escena in ('linea recta', 'curva izda', 'curva dcha') and err_px is not None:
-                if self._cross_label == 'straight' and abs(err_px) < self.CROSS_RELEASE_PX:
-                    self._cross_steps = 0
-                    self._cross_side = None
-                    self._cross_label = 'none'
-                elif self._cross_label == 'left' and err_px < -self.CROSS_RELEASE_PX // 2:
-                    # linea ya a la izquierda y escena simple -> giro completado
-                    self._cross_steps = 0
-                    self._cross_side = None
-                    self._cross_label = 'none'
-                elif self._cross_label == 'right' and err_px > self.CROSS_RELEASE_PX // 2:
-                    # linea ya a la derecha y escena simple -> giro completado
-                    self._cross_steps = 0
-                    self._cross_side = None
-                    self._cross_label = 'none'
+            # Liberacion del cruce:
+            # - 'straight': se libera cuando la linea esta centrada.
+            # - 'left'/'right': NO se libera por error de linea; cualquier linea
+            #   visible durante el giro puede cumplir el umbral prematuramente.
+            #   Se libera SOLO cuando _cross_steps llega a 0 (tiempo suficiente
+            #   para completar el giro de 90°).
+            if (self._cross_label == 'straight'
+                    and escena in ('linea recta', 'curva izda', 'curva dcha')
+                    and err_px is not None and abs(err_px) < self.CROSS_RELEASE_PX):
+                self._cross_steps = 0
+                self._cross_side = None
+                self._cross_label = 'none'
 
         # PRIORIDAD 3: seguir la linea (PD sobre el error de segmentacion).
         elif err_px is not None:
