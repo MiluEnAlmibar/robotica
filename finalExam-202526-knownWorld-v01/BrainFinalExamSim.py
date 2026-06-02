@@ -130,18 +130,24 @@ def runs_in_border(border_pixels):
     return runs
 
 
-def endpoints_en_roi(m_linea, roi):
+def endpoints_en_roi(m_linea, roi, grosor=4):
     """Endpoints donde la linea cruza los 4 bordes de la ROI.
-    Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}."""
+    Devuelve lista de dicts {'side', 'pt':(x,y), 'role':'entrada|salida'}.
+
+    Cada borde se mira como una BANDA de `grosor` pixeles (no una sola fila):
+    basta con que haya pixel de linea en CUALQUIER fila/columna de la banda para
+    contar el cruce. Asi la segmentacion no necesita llegar al pixel exacto del
+    borde para detectar el endpoint."""
     y0, y1, x0, x1 = roi
     sub = m_linea[y0:y1, x0:x1]
     H, W = sub.shape
+    g = max(1, min(grosor, H // 2, W // 2))
 
     borders = [
-        ('bottom', sub[H - 1, :], lambda m: (x0 + m, y0 + H - 1), 'entrada'),
-        ('top',    sub[0, :],     lambda m: (x0 + m, y0),         'salida'),
-        ('left',   sub[:, 0],     lambda m: (x0, y0 + m),         'salida'),
-        ('right',  sub[:, W - 1], lambda m: (x0 + W - 1, y0 + m), 'salida'),
+        ('bottom', sub[H - g:, :].any(axis=0), lambda m: (x0 + m, y0 + H - 1), 'entrada'),
+        ('top',    sub[:g, :].any(axis=0),      lambda m: (x0 + m, y0),          'salida'),
+        ('left',   sub[:, :g].any(axis=1),      lambda m: (x0, y0 + m),          'salida'),
+        ('right',  sub[:, W - g:].any(axis=1),  lambda m: (x0 + W - 1, y0 + m), 'salida'),
     ]
 
     endpoints = []
@@ -306,16 +312,21 @@ def hu_descriptor(img_bin):
 
 
 def extraer_marca_binaria(mask, area_min=50):
-    """Imagen 0/255 con solo el mayor contorno relleno, o None."""
+    """Imagen 0/255 con la forma de la marca rellena, o None.
+    Usa el convex hull de TODOS los contornos rojos (no solo el mayor) para
+    capturar marcas fragmentadas como la escalera (zigzag en varias piezas)."""
     m = (mask > 0).astype(np.uint8) * 255
     contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
-    cont = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(cont) < area_min:
+    area_total = sum(cv2.contourArea(c) for c in contours)
+    if area_total < area_min:
         return None
+    # Unir todos los puntos y calcular el convex hull conjunto.
+    todos = np.vstack(contours)
+    hull = cv2.convexHull(todos)
     clean = np.zeros_like(m)
-    cv2.drawContours(clean, [cont], -1, 255, -1)
+    cv2.drawContours(clean, [hull], -1, 255, -1)
     return clean
 
 
@@ -465,12 +476,14 @@ class BrainFinalExam(Brain):
     CROSS_COMMIT_STEPS = 22   # pasos que dura la memoria tras dejar de ver la flecha
     CROSS_RELEASE_PX = 45     # se libera cuando la linea esta centrada (|err| < esto)
     STRAIGHT_DEADZONE_DEG = 35  # < esto respecto a la vertical -> la flecha es "recta"
+    MARCA_VOTES = 5   # frames consecutivos necesarios para confirmar una marca
 
     def setup(self):
         self.last_error = 0.0          # error normalizado [-1, 1]
         self._lost_line_steps = 0
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
+        self._marca_votes = []    # buffer de clasificaciones recientes (max MARCA_VOTES)
 
         # Memoria del cruce en curso.
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
@@ -568,17 +581,33 @@ class BrainFinalExam(Brain):
 
     # --- clasificacion de marca -----------------------------------------
     def _clasificar_marca(self, m_marca_roi):
+        """Clasifica la marca con votacion sobre los ultimos MARCA_VOTES frames.
+        Solo confirma cuando una clase gana la mayoria absoluta del buffer."""
         if not self.knn.ok:
             return None
         mask = m_marca_roi.astype(np.uint8) * 255
         limpia = extraer_marca_binaria(mask)
         if limpia is None:
+            self._marca_votes = []
             return None
         norm = normalizar_marca(limpia)
         if norm is None:
+            self._marca_votes = []
             return None
         norm = cv2.medianBlur(norm, 5)
-        return self.knn.predict(hu_descriptor(norm))
+        clase = self.knn.predict(hu_descriptor(norm))
+        if clase is None:
+            return None
+
+        self._marca_votes.append(clase)
+        if len(self._marca_votes) > self.MARCA_VOTES:
+            self._marca_votes.pop(0)
+
+        if len(self._marca_votes) < self.MARCA_VOTES:
+            return None
+        from collections import Counter
+        mas_comun, votos = Counter(self._marca_votes).most_common(1)[0]
+        return mas_comun if votos > self.MARCA_VOTES // 2 else None
 
     # --- bucle principal -------------------------------------------------
     def step(self):
@@ -604,6 +633,7 @@ class BrainFinalExam(Brain):
         if self._avoid_obstacle():
             self._cross_steps = 0
             self._cross_label = 'none'
+            self._marca_votes = []
             if DEBUG_VIEW:
                 self._mostrar(cv_image, roi, (endpoints, escena, arrow_info, salida))
             return
