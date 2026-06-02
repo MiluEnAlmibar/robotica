@@ -353,9 +353,49 @@ def normalizar_marca(img_bin, size=100):
     return cv2.resize(recorte, (size, size))
 
 
+# Descriptores de Hu PRECALCULADOS de images/marcas/ (28 muestras, mismo pipeline
+# que entrenar()). Embebidos para que el Brain NO necesite el dataset de imagenes
+# en el robot: con esto la clasificacion de marcas funciona sin copiar carpetas.
+# (Generados con el script _calc_marcas.py.)
+MARCAS_CLASES = ['escalera', 'hombre', 'mujer', 'telefono']
+MARCAS_Y = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3]
+MARCAS_X = [
+    [0.550941, 1.459643, 3.603957, 4.866504, 9.164292, 5.778954, 9.198867],
+    [0.492817, 1.214445, 3.709520, 4.943960, -9.544864, -6.284238, -9.219567],
+    [0.580970, 1.621077, 3.634450, 5.042094, 9.474470, 6.126793, 9.352980],
+    [0.550941, 1.459643, 3.603957, 4.866504, 9.164292, 5.778954, 9.198867],
+    [0.141581, 0.319415, 3.276124, 3.501798, 6.890662, 3.662622, -8.358397],
+    [0.673360, 2.416298, 4.092482, 6.720713, -9.997560, 7.936011, -9.997886],
+    [0.287272, 0.649089, 3.358199, 3.719251, 7.258366, 4.052293, -8.380731],
+    [0.628221, 1.592848, 3.138117, 3.665661, 7.067748, 4.470364, 8.303023],
+    [0.752539, 3.504009, 3.392045, 5.153436, 9.337796, 6.936825, 9.685438],
+    [0.724996, 2.283154, 3.309827, 4.611321, 9.205951, -6.756795, -8.564093],
+    [0.705546, 2.064926, 3.265584, 4.189338, 7.954536, 5.298323, -8.287297],
+    [0.729595, 2.312662, 3.322741, 4.570175, 8.751365, 6.215771, 8.577975],
+    [0.726123, 2.229419, 3.347044, 4.505572, 8.593979, 5.993677, 8.541456],
+    [0.746171, 2.813379, 3.378800, 5.012056, 9.679176, -7.095173, -9.148463],
+    [0.732127, 2.342557, 3.695455, 4.831570, 9.480827, -6.589579, 9.060687],
+    [0.704571, 2.070581, 3.605927, 4.617448, 9.199464, -6.653388, 8.723904],
+    [0.673911, 1.800562, 3.561516, 4.092926, 7.917183, 5.008698, -9.123862],
+    [0.641538, 1.650376, 3.403459, 3.817050, 7.427058, 4.643843, 8.597724],
+    [0.593272, 1.448200, 3.294520, 3.643264, 7.113257, 4.378901, -8.164255],
+    [0.593046, 1.448204, 3.186147, 3.509136, 6.856565, 4.233335, -8.512201],
+    [0.669403, 1.803580, 3.463410, 4.272232, 8.257051, 5.720992, -8.310620],
+    [0.474173, 1.264654, 2.115258, 2.663164, 5.248106, 3.800556, 5.165474],
+    [0.469153, 1.255406, 2.117151, 2.793181, 5.828677, -4.383963, 5.263880],
+    [0.471759, 1.279931, 2.130844, 2.958494, -5.722780, -3.708109, 5.601307],
+    [0.567130, 1.772506, 2.341749, 2.771513, 5.498858, 3.873265, 5.460156],
+    [0.521650, 1.435924, 2.325260, 3.162607, -6.020409, -3.976777, -6.101045],
+    [0.504306, 1.369476, 2.262827, 3.120213, -5.846016, -3.840268, -6.229235],
+    [0.550750, 1.598026, 2.373751, 3.200847, -6.052271, -4.063473, -6.284057],
+]
+
+
 class KNNMarcas:
     """KNN (k=3) en numpy puro sobre descriptores de Hu. Se entrena cargando
-    images/marcas/<clase>/*.png al arrancar el Brain."""
+    images/marcas/<clase>/*.png, o desde los descriptores embebidos (MARCAS_X)
+    para no depender del dataset de imagenes en el robot."""
 
     def __init__(self, k=3):
         self.k = k
@@ -396,6 +436,17 @@ class KNNMarcas:
             return False
         self.X = np.array(X)
         self.y = np.array(y)
+        self.ok = True
+        return True
+
+    def cargar_embebido(self):
+        """Carga los descriptores precalculados embebidos en el modulo. No
+        necesita ningun fichero externo."""
+        if not MARCAS_X:
+            return False
+        self.clases = list(MARCAS_CLASES)
+        self.X = np.array(MARCAS_X, dtype=np.float64)
+        self.y = np.array(MARCAS_Y, dtype=int)
         self.ok = True
         return True
 
@@ -497,14 +548,24 @@ class BrainFinalExam(Brain):
         self._search_dir = self.HARD_RIGHT
         self._last_mark = None
 
-        # Fuente de imagen: camara del robot (sim) o camara USB (robot fisico).
+        # Fuente de imagen: camara del robot (simulador) o camara USB (robot
+        # fisico). Se usa la USB si se pide explicitamente (USE_ROBOT_CAMERA=False)
+        # o si el robot no expone getImage() (p.ej. el AriaRobot del Pioneer, cuya
+        # camara C920 es un webcam USB aparte): asi funciona en ambos sin tocar el
+        # flag.
         self.capture = None
-        if not USE_ROBOT_CAMERA:
+        use_usb = (not USE_ROBOT_CAMERA) or (not hasattr(self.robot, 'getImage'))
+        if use_usb:
             self.capture = cv2.VideoCapture(CAMERA_INDEX)
             self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
             self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            if not self.capture.isOpened():
-                print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX)
+            if self.capture.isOpened():
+                print("[FinalExam] Camara USB abierta (index %d)." % CAMERA_INDEX)
+            else:
+                print("[FinalExam] AVISO: no se pudo abrir la camara USB index", CAMERA_INDEX,
+                      "- prueba otro CAMERA_INDEX (1, 2, ...).")
+        else:
+            print("[FinalExam] Usando la camara del robot (getImage).")
 
         # Memoria del cruce en curso.
         self._cross_steps = 0          # pasos restantes de compromiso (0 = inactivo)
@@ -513,17 +574,21 @@ class BrainFinalExam(Brain):
         self._cross_best_area = 0      # mayor area de flecha vista en este cruce
         self._cross_label = 'none'     # 'left'/'straight'/'right' decidido
 
-        # Entrenar el clasificador de marcas desde la primera carpeta valida.
+        # Clasificador de marcas: si hay carpeta images/marcas/ se entrena de ella
+        # (util para re-entrenar con fotos reales); si no, usa los descriptores
+        # EMBEBIDOS, asi no hace falta copiar el dataset al robot.
         self.knn = KNNMarcas(k=3)
+        entrenado = False
         for cand in MARCAS_DIR_CANDIDATAS:
             if self.knn.entrenar(cand):
                 print("[FinalExam] Marcas entrenadas desde:", os.path.abspath(cand),
                       "->", self.knn.clases)
+                entrenado = True
                 break
-        if not self.knn.ok:
-            print("[FinalExam] AVISO: no se encontro images/marcas/. "
-                  "Clasificacion de marcas desactivada. "
-                  "Copia la carpeta junto al Brain o define MARCAS_DIR.")
+        if not entrenado:
+            self.knn.cargar_embebido()
+            print("[FinalExam] Marcas: usando descriptores embebidos (%d muestras, %s)."
+                  % (len(self.knn.y), self.knn.clases))
 
     def destroy(self):
         if getattr(self, 'capture', None) is not None:
