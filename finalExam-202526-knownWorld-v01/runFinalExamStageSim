@@ -1,0 +1,1 @@
+pyrobot -s StageSimulator.py -w ./finalExam-202526-line1-v01.world -r Stage.py -b ./BrainFinalExam.py
